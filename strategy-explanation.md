@@ -1,0 +1,166 @@
+# Strategy Explanation
+
+## 1. Trend Analysis Block
+
+This block focuses on identifying whether the market is trending upward, downward, or moving sideways. Your bot uses several well-known indicators together to evaluate trend health and direction:
+
+### • ADX (Average Directional Index)
+
+Measures the strength of the trend.
+
+- ADX above 20 usually signals a strong trend.
+- Combined with DI+ and DI–, it shows whether bulls or bears are in control.
+
+### • DI+ and DI– (Directional Indicators)
+
+Used together with ADX to determine the direction of the trend.
+
+- DI+ > DI– suggests bullish momentum.
+
+### • MACD and MACD Histogram
+
+- Positive histogram bars indicate upside momentum.
+- If the last few bars are rising, it implies increasing buying pressure.
+
+### • Momentum (ROC)
+
+Shows how quickly the price is moving.  
+Positive values indicate upward momentum.
+
+### • AO (Awesome Oscillator)
+
+Confirms whether short-term momentum aligns with long-term momentum.
+
+### • EMA20 / EMA50 Structure
+
+A classic trend confirmation setup:
+
+- Price above EMA20, and EMA20 above EMA50, often marks a strong uptrend.
+
+### • Higher-Timeframe Confirmation (1h)
+
+The bot checks if the 1-hour chart also supports the trend.  
+This makes the signal more reliable and filters out fake spikes.
+
+---
+
+## 2. Oscillator Block
+
+Oscillators show whether the market is overbought, oversold, or in a neutral state. Your bot uses a well-balanced combination:
+
+### • RSI (Relative Strength Index)
+
+Values between 45–65 indicate a healthy, sustainable trend.  
+Oversold reversals are also detected.
+
+### • Stochastic K
+
+Shows whether price is gaining momentum inside its range.  
+Crossing above 50 is considered bullish.
+
+### • CCI (Commodity Channel Index)
+
+CCI above 100 often marks strong bullish energy.
+
+### • Stochastic RSI
+
+Captures momentum shifts earlier than classic RSI.
+
+### • Williams %R
+
+- Values above –60 support bullish momentum.
+- Helps filter out weak setups.
+
+### • Ultimate Oscillator
+
+A multi-timeframe oscillator that works well in volatile markets.
+
+---
+
+## 3. Volume & Power Block
+
+This part focuses on actual buying pressure — whether real money is flowing into the coin.
+
+### • OBV (On-Balance Volume)
+
+A rising OBV line suggests that larger players are accumulating.  
+Your bot checks OBV over a 10-bar period for trend direction.
+
+### • Bull and Bear Power
+
+- Bull Power > 0 means buyers dominate the upper range.
+- Bear Power < 0 shows sellers are relatively weak.
+
+### • Volume Spike Detection
+
+The bot identifies unusual volume bursts (1.5× above the average), which often precede short-term moves.
+
+### • OBV + Volume Alignment
+
+When both OBV and volume spikes agree, it’s a strong confirmation of buying interest.
+
+---
+
+## 4. Price Action Block
+
+This block examines actual candlestick behavior — something algorithms often ignore, but traders rely heavily on.
+
+### • Long Lower Wick (Hammer-type candles)
+
+Indicates buyers stepped in aggressively after a dip.
+
+### • Strong Green Candle
+
+A solid bullish candle with a meaningful body, showing conviction.
+
+### • No Recent Collapse
+
+The bot checks the past 96 candles to ensure the coin hasn’t experienced a sharp dump.  
+This removes unstable or manipulated charts.
+
+### • EMA20 Breakout
+
+When price crosses above EMA20, it often signals a momentum shift.
+
+### • Minimum Volume Condition
+
+Ensures each candle has enough trading activity.  
+This prevents low-liquidity coins from producing false signals.
+
+---
+
+## 5. Prefilter Layer (Very Important)
+
+Before performing any technical analysis, the bot eliminates coins that are statistically “bad trades.”
+
+### • 24-Hour Volume Filter
+
+Coins with less than $5M daily volume are removed.  
+Low liquidity = high slippage and unreliable TA.
+
+### • Minimum Price Filter
+
+Coins under $0.02 are excluded due to manipulation risks.
+
+### • 24-Hour Price Change Filter
+
+Only coins within –15% to +20% daily change remain.  
+Avoids both collapsing charts and overstretched pumps.
+
+### • Cooldown System
+
+If a coin generated a signal recently, it won’t trigger again for the next 60 minutes.
+
+### • Top-Volume Limiting
+
+If the market has too many candidates, only the top-volume coins are analyzed.
+
+---
+
+## 6. Multi-Timeframe Structure
+
+Your bot analyzes data across several timeframes:
+
+- 15m (main timeframe)
+- 1h (trend confirmation)
+- 4h (optional for future upgrades)

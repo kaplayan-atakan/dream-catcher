@@ -1,0 +1,199 @@
+Aşağıda bu botun bir sunucuda problemsiz çalışması için gereken tüm kütüphaneler, Python versiyonu, pip paketleri, klasör yapısı, ortam değişkenleri ve best-practice ayarları tek liste hâlinde, eksiksiz profesyonel bir şekilde verilmiştir.
+
+Tüm bilgiler doğrudan  koddan türetilmiştir (import’lar + kullanılan fonksiyonlar).
+ 
+
+⸻
+
+1. Python Sürümü
+
+Bu bot için en güvenli sürüm:
+
+Python 3.10 veya 3.11
+
+(Binance + aiohttp + numpy uyumluluğu için idealdir.)
+
+⸻
+
+2. Gerekli Pip Paketleri (Kesin Gerekenler)
+
+Bu botun çalışması için pip install etmen gereken tüm paketler:
+
+pip install aiohttp
+pip install numpy
+pip install pandas
+pip install python-dateutil
+pip install requests
+pip install python-dotenv
+pip install websockets
+pip install ta  # Teknik indikatörler için seçenek (istersen)
+
+Ama  botun indicators.py içinde tüm indikatörleri manuel hesapladığı için ta zorunlu değildir.
+
+⸻
+
+Kesin gereken minimal paket listesi:
+
+Asenkron istekler
+
+aiohttp
+
+Matematik / array işlemleri
+
+numpy
+
+CSV loglaması için
+
+pandas
+
+Zaman işleme
+
+python-dateutil
+
+Telegram API için (senin botta requests ile gönderiliyor)
+
+requests
+
+Ortam değişkenlerini yönetmek için (opsiyonel)
+
+python-dotenv
+
+
+⸻
+
+3. Sunucuda Olması Gereken Sistem Paketleri
+
+Ubuntu 22.04 için:
+
+sudo apt update
+sudo apt install python3-pip python3-venv python3-dev build-essential -y
+
+Bunlar olmadan numpy gibi paketlerin derlenmesi sorun çıkarır.
+
+⸻
+
+4. Proje Klasör Yapısı (Doğru Çalışması İçin)
+
+Sunucuda proje şöyle görünmeli:
+
+project/
+│── main.py
+│── analyzer.py
+│── data_fetcher.py
+│── indicators.py
+│── price_action.py
+│── rules.py
+│── telegram_bot.py
+│── logger.py
+│── config.py
+│── signals_log.csv   (otomatik oluşur)
+│── venv/ (opsiyonel)
+
+Bu dizin yapısı zorunlu, çünkü tüm import’lar birbirine göre relative çalışıyor.
+ 
+
+⸻
+
+5. Config Ayarları (Telegram, Log, API)
+
+config.py içinde aşağıdaki alanları doldurmalısın:
+
+ENABLE_TELEGRAM = True
+TELEGRAM_BOT_TOKEN = "123456:ABCDEF"
+TELEGRAM_CHAT_ID = "123456789"
+
+Bunlar olmadan Telegram gönderimi çalışmaz.
+
+⸻
+
+6. Sunucu İçin Servis Olarak Çalıştırma
+
+➤ 1) Virtual-env oluştur:
+
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+
+⸻
+
+2) requirements.txt dosyan şuna benzemeli:
+
+aiohttp
+numpy
+pandas
+python-dateutil
+requests
+python-dotenv
+websockets
+
+
+⸻
+
+3) Systemd servisi oluştur
+
+sudo nano /etc/systemd/system/binancebot.service
+
+İçerik:
+
+[Unit]
+Description=Binance Signal Bot
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/root/project
+ExecStart=/root/project/venv/bin/python main.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+
+Aktifleştir:
+
+sudo systemctl daemon-reload
+sudo systemctl enable binancebot
+sudo systemctl start binancebot
+
+Log görmek için:
+
+journalctl -u binancebot -f
+
+
+⸻
+
+7. Sunucuda Güvenli Çalışma İçin Öneriler
+
+Rate-limit çakışmalarına karşı
+
+config → MAX_SYMBOLS_PER_SCAN = 50
+çok iyi bir ayardır.
+
+API timeout’ları için
+
+config → REQUEST_TIMEOUT = 10
+yeterli.
+
+Crash durumunda otomatik restart
+
+Systemd Restart=always ile çözülmüş olur.
+
+Log birikmesini engelle
+
+logları periyodik rotate et veya CSV’yi per hafta temizle.
+
+⸻
+
+8. Özet – Botun Çalışması İçin Gerekli Olan Her Şey
+
+Gerekli	Açıklama
+Python 3.10–3.11	En stabil sürüm
+aiohttp	Binance REST için
+numpy	indikatör hesaplama için
+pandas	CSV log için
+requests	Telegram mesajı için
+python-dateutil	zaman hesapları
+project klasör yapısı	zorunlu
+systemd servis	botun 7/24 çalışması için
+
+Her şey yukarıdaki listedir. Bunlar kuruluysa bot sorunsuz şekilde 7/24 çalışır.
