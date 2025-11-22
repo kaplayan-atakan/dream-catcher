@@ -30,6 +30,8 @@ def format_signal_message(signal: Dict[str, object]) -> str:
     label = signal.get("label", "NONE")
     symbol = signal.get("symbol", "UNKNOWN")
     emoji = _LABEL_EMOJI.get(label, _DEFAULT_EMOJI)
+    trend_details = signal.get("trend_details") or {}
+    vol_details = signal.get("vol_details") or {}
     lines = [
         f"{emoji} {label} - {symbol}",
         "• Price: {price:.4f} USDT | 24h: {change:+.2f}% | Vol: {vol:,.0f} USDT".format(
@@ -45,6 +47,45 @@ def format_signal_message(signal: Dict[str, object]) -> str:
             total=signal.get("total_score", 0),
         ),
     ]
+
+    htf_bits = []
+    if signal.get("mtf_trend_confirmed") or trend_details.get("mtf_trend_confirmed"):
+        htf_bits.append("1h EMA stack ok")
+    elif trend_details.get("htf_price_above_ema"):
+        htf_bits.append("1h above EMA20")
+
+    if signal.get("fourh_alignment_ok"):
+        htf_bits.append("4h EMA stack ok")
+    elif signal.get("fourh_price_above_ema20"):
+        htf_bits.append("4h above EMA20")
+
+    slope = signal.get("fourh_ema20_slope_pct") or trend_details.get("fourh_ema20_slope_pct")
+    if slope:
+        htf_bits.append(f"4h EMA20 slope {float(slope):+.1f}%")
+
+    if htf_bits:
+        lines.append("• HTF: " + ", ".join(htf_bits[:3]))
+
+    vol_bits = []
+    if vol_details.get("volume_spike"):
+        spike_factor = vol_details.get("volume_spike_factor")
+        if spike_factor:
+            vol_bits.append(f"Spike {float(spike_factor):.1f}x avg")
+        else:
+            vol_bits.append("Volume spike vs avg")
+
+    obv_change = vol_details.get("obv_change_pct")
+    if obv_change:
+        vol_bits.append(f"OBV {float(obv_change):+.1f}%/{config.OBV_TREND_LOOKBACK} bars")
+
+    bull_power = vol_details.get("bull_power")
+    bear_power = vol_details.get("bear_power")
+    if bull_power is not None and bear_power is not None:
+        vol_bits.append(f"Bull {float(bull_power):.4f} | Bear {float(bear_power):.4f}")
+
+    if vol_bits:
+        lines.append("• Volume: " + ", ".join(vol_bits[:3]))
+
     reasons = signal.get("reasons") or []
     if reasons:
         lines.append("• Top reasons:")

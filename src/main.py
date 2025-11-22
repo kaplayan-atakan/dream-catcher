@@ -8,7 +8,6 @@ import aiohttp
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Set
-import json
 
 # Import modules
 import config
@@ -23,6 +22,26 @@ logger = log_module.setup_logger()
 # Global state
 last_signal_times: Dict[str, datetime] = {}
 active_symbols: Set[str] = set()
+
+
+def _log_prefilter_density(total_pairs: int, kept_pairs: int) -> None:
+    """Emit Phase 3 transparency hints about how strict the current filters are."""
+    if total_pairs <= 0:
+        return
+    keep_ratio = kept_pairs / total_pairs
+    logger.info(
+        "Prefilter keep ratio: %.2f%% (%d/%d)", keep_ratio * 100, kept_pairs, total_pairs
+    )
+
+    # Hooks for future dynamic thresholds – for now we only surface guidance to operators.
+    if keep_ratio > 0.20:
+        logger.info(
+            "Prefilter note: High candidate density detected; future runs may tighten volume/change gates"
+        )
+    elif keep_ratio < 0.02:
+        logger.info(
+            "Prefilter note: Very few candidates surviving; future runs may relax thresholds slightly"
+        )
 
 
 async def process_symbol_batch(session: aiohttp.ClientSession, 
@@ -69,25 +88,36 @@ async def scan_market(session: aiohttp.ClientSession) -> List[dict]:
         
         # Step 2: Parse and apply PREFILTERS
         filtered_symbols = []
+        prefilter_stats = {
+            "non_usdt": 0,
+            "volume": 0,
+            "price": 0,
+            "change": 0,
+            "cooldown": 0,
+        }
         
         for ticker in tickers:
             try:
                 # Parse ticker data
                 parsed = data_fetcher.parse_ticker_data(ticker)
                 if parsed is None:
+                    prefilter_stats["non_usdt"] += 1
                     logger.debug("Skipping non-USDT ticker")
                     continue
                 
                 # PREFILTER 1: Minimum 24h volume
                 if parsed['quote_volume'] < config.MIN_24H_QUOTE_VOLUME:
+                    prefilter_stats["volume"] += 1
                     continue
                 
                 # PREFILTER 2: Minimum price
                 if parsed['price'] < config.MIN_PRICE_USDT:
+                    prefilter_stats["price"] += 1
                     continue
                 
                 # PREFILTER 3: 24h price change range
                 if not (config.MIN_24H_CHANGE <= parsed['price_change_pct'] <= config.MAX_24H_CHANGE):
+                    prefilter_stats["change"] += 1
                     continue
                 
                 # PREFILTER 4: Skip if in cooldown
@@ -96,6 +126,7 @@ async def scan_market(session: aiohttp.ClientSession) -> List[dict]:
                     time_since_signal = datetime.now() - last_signal_times[symbol]
                     if time_since_signal < timedelta(minutes=config.COOLDOWN_MINUTES):
                         logger.debug(f"Skipping {symbol} - in cooldown ({time_since_signal.seconds//60} min)")
+                        prefilter_stats["cooldown"] += 1
                         continue
                 
                 filtered_symbols.append(parsed)
@@ -104,7 +135,16 @@ async def scan_market(session: aiohttp.ClientSession) -> List[dict]:
                 logger.error(f"Error parsing ticker: {e}")
                 continue
         
-        logger.info(f"After prefilters: {len(filtered_symbols)} symbols to analyze")
+        logger.info(
+            "Prefilter summary - kept: %d | volume: %d | price: %d | change: %d | cooldown: %d | non-USDT: %d",
+            len(filtered_symbols),
+            prefilter_stats["volume"],
+            prefilter_stats["price"],
+            prefilter_stats["change"],
+            prefilter_stats["cooldown"],
+            prefilter_stats["non_usdt"],
+        )
+        _log_prefilter_density(len(tickers), len(filtered_symbols))
         
         # Step 3: Limit symbols if configured
         if config.MAX_SYMBOLS_PER_SCAN and len(filtered_symbols) > config.MAX_SYMBOLS_PER_SCAN:

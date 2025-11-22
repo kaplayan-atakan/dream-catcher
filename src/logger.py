@@ -28,6 +28,8 @@ _DEFAULT_COLUMNS = [
     "change_24h",
     "quote_vol_24h",
     "reasons",
+    "htf_notes",
+    "vol_spike_factor",
 ]
 
 
@@ -74,6 +76,29 @@ def log_signal_to_csv(
         "quote_vol_24h": signal.get("quote_volume"),
         "reasons": "; ".join(signal.get("reasons", [])) if signal.get("reasons") else "",
     }
+
+    trend_details = signal.get("trend_details") or {}
+    vol_details = signal.get("vol_details") or {}
+
+    htf_bits = []
+    if signal.get("mtf_trend_confirmed") or trend_details.get("mtf_trend_confirmed"):
+        htf_bits.append("1h-stack")
+    elif trend_details.get("htf_price_above_ema"):
+        htf_bits.append("1h>EMA20")
+
+    if signal.get("fourh_alignment_ok"):
+        htf_bits.append("4h-stack")
+    elif signal.get("fourh_price_above_ema20"):
+        htf_bits.append("4h>EMA20")
+
+    slope = signal.get("fourh_ema20_slope_pct") or trend_details.get("fourh_ema20_slope_pct")
+    if slope:
+        htf_bits.append(f"4h-slope={float(slope):+.1f}%")
+
+    row["htf_notes"] = " | ".join(htf_bits)
+
+    spike_factor = vol_details.get("volume_spike_factor")
+    row["vol_spike_factor"] = round(float(spike_factor), 2) if spike_factor else ""
 
     if extra_fields:
         row.update(extra_fields)

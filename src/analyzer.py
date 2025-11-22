@@ -2,7 +2,7 @@
 Symbol Analyzer Module - REAL INDICATORS & CALCULATIONS
 """
 import logging
-from typing import Optional, Dict
+from typing import Optional
 
 import numpy as np
 
@@ -107,12 +107,16 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
         
         # Volume indicators - latest
         obv_uptrend = indicators.is_obv_uptrend(obv_values, config.OBV_TREND_LOOKBACK)
+        obv_change_pct = indicators.obv_change_percent(obv_values, config.OBV_TREND_LOOKBACK)
         last_bull_power = bull_power_values[-1] if bull_power_values[-1] is not np.nan else 0
         last_bear_power = bear_power_values[-1] if bear_power_values[-1] is not np.nan else 0
         
         # ============ MULTI-TIMEFRAME ANALYSIS ============
         mtf_trend_confirmed = False
         htf_price_above_ema = False
+        ht4_price_above_ema20 = False
+        ht4_alignment = False
+        ht4_ema20_slope_pct = 0.0
         
         if '1h' in klines_data and len(klines_data['1h']) >= 50:
             htf_closes = [k['close'] for k in klines_data['1h']]
@@ -126,10 +130,41 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
                 if htf_ema50[-1] is not np.nan:
                     mtf_trend_confirmed = (htf_closes[-1] > htf_ema20[-1] > htf_ema50[-1])
         
+        fourh_context = {}
+        if '4h' in klines_data and len(klines_data['4h']) >= 50:
+            h4_closes = [k['close'] for k in klines_data['4h']]
+            h4_ema20 = indicators.ema(h4_closes, 20)
+            h4_ema50 = indicators.ema(h4_closes, 50)
+            latest_ema20 = h4_ema20[-1]
+            latest_ema50 = h4_ema50[-1]
+            latest_close_h4 = h4_closes[-1]
+
+            if latest_ema20 is not np.nan:
+                ht4_price_above_ema20 = latest_close_h4 > latest_ema20
+
+            if latest_ema20 is not np.nan and latest_ema50 is not np.nan:
+                ht4_alignment = latest_close_h4 > latest_ema20 > latest_ema50
+
+            slope_lookback = 5
+            if len(h4_ema20) > slope_lookback and latest_ema20 is not np.nan:
+                past_ema = h4_ema20[-(slope_lookback + 1)]
+                if past_ema is not np.nan and past_ema != 0:
+                    ht4_ema20_slope_pct = ((latest_ema20 / past_ema) - 1) * 100
+
+            fourh_context = {
+                "fourh_last_close": latest_close_h4,
+                "fourh_ema20": latest_ema20 if latest_ema20 is not np.nan else None,
+                "fourh_ema50": latest_ema50 if latest_ema50 is not np.nan else None,
+                "fourh_price_above_ema20": ht4_price_above_ema20,
+                "fourh_ema_alignment_ok": ht4_alignment,
+                "fourh_ema20_slope_pct": ht4_ema20_slope_pct,
+            }
+
         # ============ PRICE ACTION ANALYSIS ============
         pa_signals = price_action.analyze_price_action(
             opens, highs, lows, closes, volumes, ema20_values
         )
+        volume_spike_factor = pa_signals.get('volume_spike_factor')
         
         # ============ COMPUTE BLOCK SCORES ============
         
@@ -145,8 +180,22 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
             macd_hist_rising=macd_hist_rising,
             momentum=last_momentum,
             ao=last_ao,
-            mtf_trend=mtf_trend_confirmed
+            mtf_trend=mtf_trend_confirmed,
+            htf_price_above_ema=htf_price_above_ema,
+            fourh_price_above_ema20=ht4_price_above_ema20,
+            fourh_alignment=ht4_alignment,
+            fourh_ema20_slope_pct=ht4_ema20_slope_pct,
         )
+        if trend_block.details is None:
+            trend_block.details = {}
+        trend_block.details.update({
+            "htf_price_above_ema": htf_price_above_ema,
+            "fourh_price_above_ema20": ht4_price_above_ema20,
+            "fourh_ema_alignment_ok": ht4_alignment,
+            "fourh_ema20_slope_pct": ht4_ema20_slope_pct,
+        })
+        if fourh_context:
+            trend_block.details.update(fourh_context)
         
         # OSCILLATOR BLOCK
         osc_block = rules.compute_osc_block(
@@ -163,7 +212,9 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
             obv_trend=obv_uptrend,
             bull_power=last_bull_power,
             bear_power=last_bear_power,
-            volume_spike=pa_signals.get('volume_spike', False)
+            volume_spike=pa_signals.get('volume_spike', False),
+            volume_spike_factor=volume_spike_factor,
+            obv_change_pct=obv_change_pct,
         )
         
         # PRICE ACTION BLOCK
@@ -184,6 +235,9 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
         signal_result.price = symbol_data['price']
         signal_result.price_change_pct = symbol_data['price_change_pct']
         signal_result.quote_volume = symbol_data['quote_volume']
+        signal_result.fourh_price_above_ema20 = ht4_price_above_ema20
+        signal_result.fourh_alignment_ok = ht4_alignment
+        signal_result.fourh_ema20_slope_pct = ht4_ema20_slope_pct
         
         # Return only if we have a signal
         return signal_result.__dict__ if signal_result.label != "NONE" else None

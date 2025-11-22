@@ -32,3 +32,9 @@
 - Maintain pure Python + `aiohttp`/`numpy` stack; the README explicitly forbids ML heuristics. Document any strategy deviations in `docs/` comments and keep executable code aligned with the current phases.
 - Missing modules (`data_fetcher.py`, `indicators.py`, `price_action.py`, `telegram_bot.py`, `logger.py`) are expected deliverables—match the expectations spelled out in `README.md` and keep APIs stable because existing code already imports them.
 - Suggestions for Phase 2/3 enhancements belong in comments/TODOs unless those features are explicitly activated.
+
+### Response Style and Final Replies
+- Provide file blocks exactly when required by the GitHub environment, without preambles like "Preparing final response" or similar boilerplate.
+- Keep prose short and focused on what changed and why; non-code narration should be minimal even if the code payload is large.
+- Do not repeat the same file contents multiple times in one reply unless the user explicitly asks for it.
+- It is acceptable for code/file blocks to be long, but avoid verbose meta commentary outside those blocks.

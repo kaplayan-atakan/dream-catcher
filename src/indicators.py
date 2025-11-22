@@ -337,6 +337,19 @@ def is_obv_uptrend(obv_values: Sequence[float], lookback: int) -> bool:
     return _is_valid(start) and _is_valid(end) and end > start
 
 
+def obv_change_percent(obv_values: Sequence[float], lookback: int) -> float:
+    if lookback <= 0 or len(obv_values) < lookback:
+        return 0.0
+    start = obv_values[-lookback]
+    end = obv_values[-1]
+    if not (_is_valid(start) and _is_valid(end)):
+        return 0.0
+    baseline = abs(start) if abs(start) > 1e-8 else 0.0
+    if baseline == 0:
+        return 0.0
+    return (end - start) / baseline * 100.0
+
+
 # ---------- Helper utilities ----------
 
 def _to_float_array(values: Sequence[float]) -> np.ndarray:
