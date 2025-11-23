@@ -23,8 +23,10 @@ def analyze_price_action(
 ) -> Dict[str, object]:
     if not closes:
         defaults = {key: False for key in _DEFAULT_KEYS}
-        defaults["volume_spike_factor"] = 0.0
-        defaults["details"] = {}
+        defaults.update({
+            "volume_spike_factor": 0.0,
+            "details": {},
+        })
         return defaults
 
     open_val = float(opens[-1])
@@ -38,18 +40,29 @@ def analyze_price_action(
     body_pct_vs_open = abs(body) / max(abs(open_val), 1e-8) * 100
     body_pct_of_range = abs(body) / range_total * 100 if range_total else 0
 
-    if body >= 0:
-        lower_wick = open_val - low_val
-    else:
-        lower_wick = close_val - low_val
+    lower_wick = (min(open_val, close_val) - low_val)
     lower_wick_ratio = lower_wick / range_total if range_total else 0
     lower_wick_pct = lower_wick_ratio * 100
 
-    long_lower_wick = lower_wick_ratio >= 0.4 and body_pct_vs_open >= config.MIN_BODY_PCT / 2
-    strong_green = body > 0 and body_pct_vs_open >= config.MIN_BODY_PCT
+    long_lower_wick = (
+        body > 0
+        and lower_wick_ratio >= config.LONG_WICK_MIN_RATIO
+        and body_pct_vs_open >= config.MIN_BODY_PCT / 2
+    )
 
-    no_collapse, max_drop_pct = _check_no_collapse(closes)
-    ema20_break, ema20_break_details = _check_ema20_break(closes, ema20_values)
+    is_green = close_val > open_val
+    strong_green, very_strong_green, avg_body = _assess_green_candle(
+        opens,
+        closes,
+        abs(body),
+        body_pct_vs_open,
+        is_green,
+    )
+
+    collapse_ok, max_drop_pct = _check_no_collapse(closes)
+    ema_break, ema_retest, ema_details = _check_ema20_break_and_retest(
+        closes, ema20_values
+    )
     volume_spike, volume_spike_factor, avg_volume = _check_volume_spike(volumes)
     min_volume = volume_val >= config.MIN_BAR_VOLUME_USDT
     min_volume_multiple = (
@@ -60,8 +73,9 @@ def analyze_price_action(
         "body_pct_vs_open": body_pct_vs_open,
         "body_pct_of_range": body_pct_of_range,
         "lower_wick_pct": lower_wick_pct,
+        "avg_body_lookup": avg_body,
         "max_drop_pct": max_drop_pct,
-        "ema20_break_details": ema20_break_details,
+        "ema_break_details": ema_details,
         "volume_spike_factor": volume_spike_factor,
         "avg_volume": avg_volume,
         "current_volume": volume_val,
@@ -69,13 +83,16 @@ def analyze_price_action(
     }
 
     return {
-        "long_lower_wick": long_lower_wick,
-        "strong_green": strong_green,
-        "no_collapse": no_collapse,
-        "ema20_break": ema20_break,
-        "volume_spike": volume_spike,
-        "min_volume": min_volume,
-        "volume_spike_factor": volume_spike_factor,
+        "long_lower_wick": bool(long_lower_wick),
+        "strong_green": bool(strong_green),
+        "very_strong_green": bool(very_strong_green),
+        "collapse_ok": bool(collapse_ok),
+        "no_collapse": bool(collapse_ok),  # backward-compatible alias
+        "ema_breakout": bool(ema_break),
+        "ema_retest": bool(ema_retest),
+        "volume_spike": bool(volume_spike),
+        "min_volume": bool(min_volume),
+        "volume_spike_factor": float(volume_spike_factor or 0.0),
         "details": pa_details,
     }
 
@@ -83,8 +100,11 @@ def analyze_price_action(
 _DEFAULT_KEYS = (
     "long_lower_wick",
     "strong_green",
+    "very_strong_green",
+    "collapse_ok",
     "no_collapse",
-    "ema20_break",
+    "ema_breakout",
+    "ema_retest",
     "volume_spike",
     "min_volume",
 )
@@ -103,34 +123,75 @@ def _check_no_collapse(closes: Sequence[float]) -> Tuple[bool, float]:
     return drop_pct <= config.COLLAPSE_MAX_DROP_PCT, drop_pct
 
 
-def _check_ema20_break(
+def _assess_green_candle(
+    opens: Sequence[float],
+    closes: Sequence[float],
+    current_body_abs: float,
+    body_pct_vs_open: float,
+    is_green: bool,
+) -> Tuple[bool, bool, float]:
+    lookback = min(config.STRONG_GREEN_LOOKBACK, len(opens))
+    if lookback < 2:
+        return body_pct_vs_open >= config.MIN_BODY_PCT and is_green, False, current_body_abs
+    recent_opens = np.asarray(opens[-lookback:], dtype=float)
+    recent_closes = np.asarray(closes[-lookback:], dtype=float)
+    bodies = np.abs(recent_closes - recent_opens)
+    avg_body = float(np.mean(bodies)) if bodies.size else 0.0
+    strong_green = is_green and body_pct_vs_open >= config.MIN_BODY_PCT
+    very_strong = (
+        avg_body > 0
+        and is_green
+        and current_body_abs >= config.STRONG_GREEN_BODY_MULTIPLIER * avg_body
+    )
+    if very_strong:
+        strong_green = True
+    return strong_green, very_strong, avg_body
+
+
+def _check_ema20_break_and_retest(
     closes: Sequence[float], ema20_values: Sequence[float]
-) -> Tuple[bool, Dict[str, float]]:
-    if len(closes) < 2 or len(ema20_values) < 2:
-        return False, {
-            "prev_close": 0.0,
-            "curr_close": 0.0,
-            "prev_ema20": 0.0,
-            "curr_ema20": 0.0,
-        }
-    prev_close = closes[-2]
-    curr_close = closes[-1]
-    prev_ema = ema20_values[-2]
-    curr_ema = ema20_values[-1]
-    if any(np.isnan(val) for val in (prev_ema, curr_ema)):
-        return False, {
-            "prev_close": float(prev_close),
-            "curr_close": float(curr_close),
-            "prev_ema20": float(prev_ema),
-            "curr_ema20": float(curr_ema),
-        }
-    breakout = prev_close <= prev_ema and curr_close > curr_ema
-    return breakout, {
-        "prev_close": float(prev_close),
-        "curr_close": float(curr_close),
-        "prev_ema20": float(prev_ema),
-        "curr_ema20": float(curr_ema),
+) -> Tuple[bool, bool, Dict[str, float]]:
+    if len(closes) < 3 or len(ema20_values) < 3:
+        return False, False, {}
+    lookback = min(config.EMA_BREAK_LOOKBACK, len(closes) - 1)
+    start_idx = len(closes) - lookback
+    breakout_idx = None
+    for idx in range(max(1, start_idx), len(closes)):
+        prev_close = closes[idx - 1]
+        curr_close = closes[idx]
+        prev_ema = ema20_values[idx - 1]
+        curr_ema = ema20_values[idx]
+        if any(np.isnan(val) for val in (prev_ema, curr_ema)):
+            continue
+        if prev_close <= prev_ema and curr_close > curr_ema:
+            breakout_idx = idx
+            break
+
+    if breakout_idx is None:
+        return False, False, {}
+
+    retest = _check_retest(closes, ema20_values, breakout_idx)
+    details = {
+        "breakout_index": breakout_idx,
+        "breakout_close": float(closes[breakout_idx]),
+        "breakout_ema": float(ema20_values[breakout_idx]),
+        "retest": retest,
     }
+    return True, retest, details
+
+
+def _check_retest(closes: Sequence[float], ema20_values: Sequence[float], breakout_idx: int) -> bool:
+    tolerance = config.EMA_NEAR_TOLERANCE
+    max_idx = min(len(closes), breakout_idx + config.EMA_RETEST_LOOKBACK)
+    for idx in range(breakout_idx + 1, max_idx):
+        ema = ema20_values[idx]
+        close = closes[idx]
+        if ema == 0 or np.isnan(ema):
+            continue
+        if abs(close - ema) / abs(ema) <= tolerance:
+            if idx + 1 < len(closes) and closes[idx + 1] > ema20_values[idx + 1]:
+                return True
+    return False
 
 
 def _check_volume_spike(volumes: Sequence[float]) -> Tuple[bool, float, float]:

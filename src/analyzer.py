@@ -104,31 +104,42 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
         last_stoch_rsi = stoch_rsi_values[-1] if stoch_rsi_values[-1] is not np.nan else 50
         last_williams_r = williams_r_values[-1] if williams_r_values[-1] is not np.nan else -50
         last_uo = uo_values[-1] if uo_values[-1] is not np.nan else 50
+        last_stoch_rsi_prev = None
+        if len(stoch_rsi_values) >= 2 and stoch_rsi_values[-2] is not np.nan:
+            last_stoch_rsi_prev = stoch_rsi_values[-2]
+        last_uo_prev = None
+        if len(uo_values) >= 2 and uo_values[-2] is not np.nan:
+            last_uo_prev = uo_values[-2]
         
         # Volume indicators - latest
-        obv_uptrend = indicators.is_obv_uptrend(obv_values, config.OBV_TREND_LOOKBACK)
         obv_change_pct = indicators.obv_change_percent(obv_values, config.OBV_TREND_LOOKBACK)
         last_bull_power = bull_power_values[-1] if bull_power_values[-1] is not np.nan else 0
         last_bear_power = bear_power_values[-1] if bear_power_values[-1] is not np.nan else 0
         
         # ============ MULTI-TIMEFRAME ANALYSIS ============
-        mtf_trend_confirmed = False
-        htf_price_above_ema = False
+        htf_context = {
+            "close_above_ema20": False,
+            "ema20_slope_pct": 0.0,
+            "macd_hist": 0.0,
+        }
         ht4_price_above_ema20 = False
         ht4_alignment = False
         ht4_ema20_slope_pct = 0.0
         
-        if '1h' in klines_data and len(klines_data['1h']) >= 50:
+        if '1h' in klines_data and len(klines_data['1h']) >= 30:
             htf_closes = [k['close'] for k in klines_data['1h']]
-            htf_ema20 = indicators.ema(htf_closes, 20)
-            
-            if htf_ema20[-1] is not np.nan:
-                htf_price_above_ema = htf_closes[-1] > htf_ema20[-1]
-                
-                # Check if 1h is also in uptrend
-                htf_ema50 = indicators.ema(htf_closes, 50)
-                if htf_ema50[-1] is not np.nan:
-                    mtf_trend_confirmed = (htf_closes[-1] > htf_ema20[-1] > htf_ema50[-1])
+            htf_ema20 = indicators.ema(htf_closes, config.EMA_FAST)
+            if htf_ema20 and htf_ema20[-1] is not np.nan:
+                latest_ema20 = htf_ema20[-1]
+                htf_context["close_above_ema20"] = htf_closes[-1] > latest_ema20
+                slope_lookback = config.HTF_EMA_SLOPE_LOOKBACK
+                if len(htf_ema20) > slope_lookback and htf_ema20[-(slope_lookback + 1)] is not np.nan:
+                    past_ema = htf_ema20[-(slope_lookback + 1)]
+                    if past_ema:
+                        htf_context["ema20_slope_pct"] = ((latest_ema20 / past_ema) - 1) * 100
+            _, _, htf_macd_hist = indicators.macd(htf_closes)
+            if htf_macd_hist and htf_macd_hist[-1] is not np.nan:
+                htf_context["macd_hist"] = htf_macd_hist[-1]
         
         fourh_context = {}
         if '4h' in klines_data and len(klines_data['4h']) >= 50:
@@ -180,16 +191,10 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
             macd_hist_rising=macd_hist_rising,
             momentum=last_momentum,
             ao=last_ao,
-            mtf_trend=mtf_trend_confirmed,
-            htf_price_above_ema=htf_price_above_ema,
-            fourh_price_above_ema20=ht4_price_above_ema20,
-            fourh_alignment=ht4_alignment,
-            fourh_ema20_slope_pct=ht4_ema20_slope_pct,
         )
         if trend_block.details is None:
             trend_block.details = {}
         trend_block.details.update({
-            "htf_price_above_ema": htf_price_above_ema,
             "fourh_price_above_ema20": ht4_price_above_ema20,
             "fourh_ema_alignment_ok": ht4_alignment,
             "fourh_ema20_slope_pct": ht4_ema20_slope_pct,
@@ -204,43 +209,53 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
             cci=last_cci,
             stoch_rsi=last_stoch_rsi,
             williams_r=last_williams_r,
-            uo=last_uo
+            uo=last_uo,
+            stoch_rsi_prev=last_stoch_rsi_prev,
+            uo_prev=last_uo_prev,
         )
         
         # VOLUME BLOCK
         vol_block = rules.compute_volume_block(
-            obv_trend=obv_uptrend,
             bull_power=last_bull_power,
             bear_power=last_bear_power,
-            volume_spike=pa_signals.get('volume_spike', False),
             volume_spike_factor=volume_spike_factor,
             obv_change_pct=obv_change_pct,
         )
         
         # PRICE ACTION BLOCK
         pa_block = rules.compute_price_action_block(pa_signals)
+
+        # HTF BONUS BLOCK
+        htf_block = rules.compute_htf_bonus(htf_context)
         
         # ============ SIGNAL DECISION ============
+        meta = {
+            "price": symbol_data['price'],
+            "price_change_pct": symbol_data['price_change_pct'],
+            "quote_volume": symbol_data['quote_volume'],
+        }
         signal_result = rules.decide_signal_label(
             trend_block=trend_block,
             osc_block=osc_block,
             vol_block=vol_block,
             pa_block=pa_block,
+            htf_block=htf_block,
+            meta=meta,
             rsi_value=last_rsi,
-            htf_trend_ok=htf_price_above_ema,  # For ULTRA_BUY
-            symbol=symbol
+            symbol=symbol,
         )
         
         # Add market data to result
         signal_result.price = symbol_data['price']
         signal_result.price_change_pct = symbol_data['price_change_pct']
         signal_result.quote_volume = symbol_data['quote_volume']
+        signal_result.htf_price_above_ema = bool(htf_context.get("close_above_ema20"))
         signal_result.fourh_price_above_ema20 = ht4_price_above_ema20
         signal_result.fourh_alignment_ok = ht4_alignment
         signal_result.fourh_ema20_slope_pct = ht4_ema20_slope_pct
         
         # Return only if we have a signal
-        return signal_result.__dict__ if signal_result.label != "NONE" else None
+        return signal_result.__dict__ if signal_result.label != "NO_SIGNAL" else None
         
     except Exception as e:
         logger.error(f"Error analyzing {symbol_data.get('symbol', 'Unknown')}: {e}")
