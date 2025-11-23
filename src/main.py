@@ -171,8 +171,8 @@ async def scan_market(session: aiohttp.ClientSession) -> List[dict]:
             if i + batch_size < len(filtered_symbols):
                 await asyncio.sleep(1)
         
-        # Step 5: Filter for actual signals (not NONE)
-        valid_signals = [s for s in all_signals if s and s.get('label') != 'NONE']
+        # Step 5: Filter for actual signals (exclude NO_SIGNAL)
+        valid_signals = [s for s in all_signals if s and s.get('label') != 'NO_SIGNAL']
         
         return valid_signals
         
@@ -188,11 +188,27 @@ async def main_loop():
     logger.info("=" * 60)
     logger.info("Configuration:")
     logger.info(f"  • Min 24h Volume: ${config.MIN_24H_QUOTE_VOLUME:,.0f}")
-    logger.info(f"  • Price Range: {config.MIN_24H_CHANGE}% to {config.MAX_24H_CHANGE}%")
+    logger.info(f"  • 24h Change Range: {config.MIN_24H_CHANGE}% to {config.MAX_24H_CHANGE}%")
     logger.info(f"  • Min Price: ${config.MIN_PRICE_USDT}")
-    logger.info(f"  • Score Thresholds:")
-    logger.info(f"    - STRONG_BUY: {config.STRONG_BUY_SCORE}")
-    logger.info(f"    - ULTRA_BUY: {config.ULTRA_BUY_SCORE}")
+    logger.info("  • Core Score Thresholds:")
+    logger.info(
+        "    - WATCH when core ≥ %d (below this = NO_SIGNAL)",
+        config.CORE_SCORE_WATCH_MIN,
+    )
+    logger.info(
+        "    - STRONG_BUY when core ≥ %d with Trend≥%d & Vol≥%d",
+        config.CORE_SCORE_STRONG_MIN,
+        config.TREND_MIN_FOR_STRONG,
+        config.VOL_MIN_FOR_STRONG,
+    )
+    logger.info(
+        "    - ULTRA_BUY when core ≥ %d plus Trend≥%d, Osc≥%d, Vol≥%d, HTF≥%d",
+        config.CORE_SCORE_ULTRA_MIN,
+        config.TREND_MIN_FOR_ULTRA,
+        config.OSC_MIN_FOR_ULTRA,
+        config.VOL_MIN_FOR_ULTRA,
+        config.HTF_MIN_FOR_ULTRA,
+    )
     logger.info(f"  • Cooldown: {config.COOLDOWN_MINUTES} minutes")
     logger.info(f"  • Telegram: {'✅ Enabled' if config.ENABLE_TELEGRAM else '❌ Disabled'}")
     logger.info(f"  • Main Timeframe: {config.MAIN_TIMEFRAME}")
@@ -250,6 +266,9 @@ async def main_loop():
                             symbol = signal['symbol']
                             last_signal_times[symbol] = datetime.now()
                             total_signals += 1
+
+                            label = signal.get('label')
+                            should_notify = label in {"STRONG_BUY", "ULTRA_BUY"}
                             
                             # Log to CSV
                             log_module.log_signal_to_csv(
@@ -258,22 +277,39 @@ async def main_loop():
                                 extra_fields={
                                     'price': signal.get('price'),
                                     'change_24h': signal.get('price_change_pct'),
-                                    'quote_vol_24h': signal.get('quote_volume')
+                                    'quote_vol_24h': signal.get('quote_volume'),
                                 }
                             )
                             
                             # Send to Telegram
-                            if config.ENABLE_TELEGRAM and not in_warmup:
+                            if config.ENABLE_TELEGRAM and should_notify and not in_warmup:
                                 message = telegram_bot.format_signal_message(signal)
                                 await telegram_bot.send_telegram_message(message)
                             
                             # Console output
-                            label_emoji = "🚀" if signal['label'] == "ULTRA_BUY" else "📈"
-                            logger.info(f"{label_emoji} {signal['label']}: {symbol}")
+                            label_emoji = {
+                                "ULTRA_BUY": "🚀",
+                                "STRONG_BUY": "📈",
+                                "WATCH": "👀",
+                            }.get(label, "ℹ️")
+                            logger.info(f"{label_emoji} {label}: {symbol}")
+                            core_score = signal.get('score_core', signal.get('total_score', 0))
+                            htf_bonus = signal.get('htf_bonus', 0)
+                            total_score = signal.get('score_total', signal.get('total_score', 0))
                             logger.info(f"   Price: ${signal.get('price', 0):.6f}")
-                            logger.info(f"   Scores: T={signal['trend_score']} O={signal['osc_score']} " +
-                                      f"V={signal['vol_score']} PA={signal['pa_score']} " +
-                                      f"TOTAL={signal['total_score']}")
+                            logger.info(
+                                "   Scores: T=%s O=%s V=%s PA=%s | Core=%s HTF+%s Total=%s",
+                                signal.get('trend_score'),
+                                signal.get('osc_score'),
+                                signal.get('vol_score'),
+                                signal.get('pa_score'),
+                                core_score,
+                                htf_bonus,
+                                total_score,
+                            )
+                            risk_tag = signal.get('risk_tag')
+                            if risk_tag and risk_tag != "NORMAL":
+                                logger.info("   Risk Tag: %s", risk_tag)
                             
                         except Exception as e:
                             logger.error(f"Error processing signal: {e}")
