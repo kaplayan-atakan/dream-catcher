@@ -1,62 +1,26 @@
-"""
-Rule-based Scoring System - COMPLETE IMPLEMENTATION
-NO ML/AI - Pure rule-based logic
-"""
-from dataclasses import dataclass
+"""Rule-based scoring aligned with the revised Phase 3 spec."""
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import config
 
-# Phase 3: Score registries keep weights centralized so future configuration
-# knobs can move into config.py without rewriting block logic.
-TREND_WEIGHTS = {
-    "adx_strong": 2.0,
-    "adx_moderate": 1.0,
-    "ema_alignment": 1.0,
-    "ema_reclaim": 0.5,
-    "macd_positive": 0.5,
-    "macd_rising_bonus": 1.5,
-    "momentum_confluence": 1.0,
-    "momentum_partial": 0.5,
-    "mtf_confirm": 1.0,
-}
 
-OSC_WEIGHTS = {
-    "rsi_healthy": 1.0,
-    "rsi_recovery": 0.5,
-    "stoch_bullish": 1.0,
-    "stoch_mid": 0.5,
-    "cci_strong": 1.0,
-    "cci_positive": 0.5,
-    "stoch_rsi_high": 0.5,
-    "stoch_rsi_rising": 0.5,
-    "williams_bullish": 1.0,
-    "williams_neutral": 0.5,
-    "uo_bullish": 1.0,
-}
+def _clamp(value: int, ceiling: int = 5) -> int:
+    return min(value, ceiling)
 
-VOLUME_WEIGHTS = {
-    "obv_uptrend": 1.5,
-    "volume_spike": 1.0,
-    "bull_domination": 1.5,
-    "bull_positive": 0.5,
-    "obv_volume_confluence": 0.5,
-}
 
-PRICE_ACTION_WEIGHTS = {
-    "long_lower_wick": 1.5,
-    "strong_green": 1.0,
-    "no_collapse": 1.0,
-    "ema20_break": 1.5,
-    "volume_confirm": 1.0,
-    "min_volume_only": 0.5,
-}
+def _ema_similarity(ema_fast: Optional[float], ema_slow: Optional[float]) -> bool:
+    if ema_fast in (None, 0) or ema_slow in (None, 0):
+        return False
+    diff_ratio = abs(ema_fast - ema_slow) / max(abs(ema_slow), 1e-8)
+    return diff_ratio <= config.EMA_SIMILARITY_TOLERANCE
 
 @dataclass
 class BlockScore:
     score: int
     reasons: List[str]
     details: Optional[Dict[str, Any]] = None
+
 
 @dataclass
 class SignalResult:
@@ -65,22 +29,30 @@ class SignalResult:
     osc_score: int
     vol_score: int
     pa_score: int
-    total_score: int
+    htf_bonus: int
+    score_core: int
+    score_total: int
     label: str
     reasons: List[str]
     rsi: float
-    price: float = 0
-    price_change_pct: float = 0
-    quote_volume: float = 0
+    price: float = 0.0
+    price_change_pct: float = 0.0
+    quote_volume: float = 0.0
+    risk_tag: Optional[str] = None
     trend_details: Optional[Dict[str, Any]] = None
     osc_details: Optional[Dict[str, Any]] = None
     vol_details: Optional[Dict[str, Any]] = None
     pa_details: Optional[Dict[str, Any]] = None
+    htf_details: Optional[Dict[str, Any]] = None
     mtf_trend_confirmed: bool = False
     htf_price_above_ema: bool = False
     fourh_price_above_ema20: bool = False
     fourh_alignment_ok: bool = False
     fourh_ema20_slope_pct: float = 0.0
+    total_score: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.total_score = self.score_total
 
 
 def compute_trend_block(
@@ -94,372 +66,335 @@ def compute_trend_block(
     macd_hist_rising: bool,
     momentum: float,
     ao: float,
-    mtf_trend: bool,
-    htf_price_above_ema: bool = False,
-    fourh_price_above_ema20: bool = False,
-    fourh_alignment: bool = False,
-    fourh_ema20_slope_pct: float = 0.0,
 ) -> BlockScore:
-    """
-    Trend Block Scoring - REAL RULES
-    Components: ADX, DI+/DI-, MACD, Momentum, AO, EMA alignment
-    """
-    score = 0
-    reasons: List[str] = []
+    """Trend block implements the 0–5 rubric from the revised spec."""
+    adx_pts = 0
+    if adx >= 25:
+        adx_pts = 2
+    elif adx >= 20:
+        adx_pts = 1
+
+    di_pts = 1 if plus_di > minus_di else 0
+
     price_above_ema20 = ema20 is not None and price > ema20
-    ema_alignment_ok = (
-        ema20 is not None and ema50 is not None and price > ema20 > ema50
-    )
+    ema_stack = ema20 is not None and ema50 is not None and price > ema20 > ema50
+    ema_close = price_above_ema20 and _ema_similarity(ema20, ema50)
+    ema_pts = 2 if ema_stack else (1 if ema_close else 0)
+
+    macd_pts = 1 if (macd_hist > 0 and macd_hist_rising) else 0
+    ao_mom_pts = 1 if (momentum > 0 and ao > 0) else 0
+
+    raw_score = adx_pts + di_pts + ema_pts + macd_pts + ao_mom_pts
+    score = _clamp(raw_score)
+
+    reasons: List[str] = []
+    if adx_pts:
+        strength = "strong" if adx_pts == 2 else "moderate"
+        reasons.append(f"Trend: ADX {adx:.1f} {strength} with DI+>DI-")
+    elif di_pts:
+        reasons.append("Trend: DI+ leading DI-")
+
+    if ema_stack:
+        reasons.append("Trend: Price>EMA20>EMA50 stack intact")
+    elif ema_close:
+        reasons.append("Trend: Price above EMA20 while EMA20≈EMA50")
+
+    if macd_pts:
+        reasons.append("Trend: MACD histogram positive & rising")
+    if ao_mom_pts:
+        reasons.append("Trend: Momentum and AO both positive")
 
     details = {
         "adx": adx,
         "plus_di": plus_di,
         "minus_di": minus_di,
+        "ema20": ema20,
+        "ema50": ema50,
+        "price_above_ema20": price_above_ema20,
+        "ema_stack_ok": ema_stack,
         "macd_hist": macd_hist,
         "macd_hist_rising": macd_hist_rising,
         "momentum": momentum,
         "ao": ao,
-        "ema20": ema20,
-        "ema50": ema50,
-        "price_above_ema20": price_above_ema20,
-        "ema_alignment_ok": ema_alignment_ok,
-        "mtf_trend_confirmed": mtf_trend,
-        "htf_price_above_ema": htf_price_above_ema,
-        "fourh_price_above_ema20": fourh_price_above_ema20,
-        "fourh_ema_alignment_ok": fourh_alignment,
-        "fourh_ema20_slope_pct": fourh_ema20_slope_pct,
     }
-
-    # Rule 1: ADX Strong Trend with Bullish DI
-    if adx >= config.ADX_STRONG_TREND and plus_di > minus_di:
-        score += TREND_WEIGHTS["adx_strong"]
-        reasons.append(f"Trend: ADX={adx:.1f} strong, DI+>DI-")
-    elif adx >= config.ADX_STRONG_TREND * 0.7 and plus_di > minus_di:
-        score += TREND_WEIGHTS["adx_moderate"]
-        reasons.append(f"Trend: ADX={adx:.1f} moderate, DI+>DI-")
-
-    # Rule 2: EMA Alignment (Price > EMA20 > EMA50)
-    if ema_alignment_ok:
-        score += TREND_WEIGHTS["ema_alignment"]
-        reasons.append("Trend: Price>EMA20>EMA50 alignment")
-    elif price_above_ema20:
-        score += TREND_WEIGHTS["ema_reclaim"]
-        reasons.append("Trend: Price reclaimed EMA20 support")
-
-    # Rule 3: MACD Histogram
-    if macd_hist > 0:
-        if macd_hist_rising:
-            score += TREND_WEIGHTS["macd_rising_bonus"]
-            reasons.append("Trend: MACD histogram positive & rising")
-        else:
-            score += TREND_WEIGHTS["macd_positive"]
-            reasons.append("Trend: MACD histogram positive")
-
-    # Rule 4: Momentum & AO Confluence
-    if momentum > 0 and ao > 0:
-        score += TREND_WEIGHTS["momentum_confluence"]
-        reasons.append(f"Trend: Momentum {momentum:.2f} & AO {ao:.4f} both bullish")
-    elif momentum > 0 or ao > 0:
-        score += TREND_WEIGHTS["momentum_partial"]
-        reasons.append("Trend: One of Momentum/AO turning positive")
-
-    # Rule 5: Multi-timeframe Confirmation
-    if mtf_trend:
-        score += TREND_WEIGHTS["mtf_confirm"]
-        reasons.append("Trend: 1h EMA stack confirms uptrend")
-    elif htf_price_above_ema:
-        reasons.append("Trend: 1h price above EMA20 (watching for alignment)")
-
-    # Rule 6: 4h context (informational bonus only for Phase 3 transparency)
-    if fourh_alignment:
-        reasons.append("Trend: 4h EMA stack aligned with bulls")
-    elif fourh_price_above_ema20:
-        reasons.append("Trend: 4h price reclaimed EMA20 support")
-
-    return BlockScore(int(score), reasons[:4], details)
+    return BlockScore(score=int(score), reasons=reasons[:4], details=details)
 
 
-def compute_osc_block(rsi_val: float, stoch_k: float, cci: float,
-                      stoch_rsi: float, williams_r: float, uo: float) -> BlockScore:
-    """
-    Oscillator Block Scoring - REAL RULES
-    Components: RSI, Stoch K, CCI, Stoch RSI, Williams %R, UO
-    """
-    score = 0
+def compute_osc_block(
+    rsi_val: float,
+    stoch_k: float,
+    cci: float,
+    stoch_rsi: float,
+    williams_r: float,
+    uo: float,
+    stoch_rsi_prev: Optional[float] = None,
+    uo_prev: Optional[float] = None,
+) -> BlockScore:
+    """Oscillator block using the 0–5 rubric."""
+    rsi_pts = 0
+    if config.RSI_STRONG_MIN <= rsi_val <= config.RSI_STRONG_MAX:
+        rsi_pts = 2
+    elif (
+        config.RSI_BUFFER_MIN <= rsi_val < config.RSI_STRONG_MIN
+        or config.RSI_STRONG_MAX < rsi_val <= config.RSI_BUFFER_MAX
+    ):
+        rsi_pts = 1
+
+    stoch_pts = 1 if stoch_k > config.STOCH_K_MIDLINE else 0
+    cci_pts = 1 if cci > config.CCI_STRONG_THRESHOLD else 0
+
+    stoch_rsi_bull = (
+        stoch_rsi > config.STOCH_RSI_BULL_LEVEL
+        and stoch_rsi_prev is not None
+        and stoch_rsi > stoch_rsi_prev
+    )
+    uo_rising = uo_prev is not None and (uo - uo_prev) >= config.UO_RISING_MIN_DELTA
+    combo_bull = stoch_rsi_bull or (williams_r > config.WILLIAMS_BULLISH and uo_rising)
+    other_pts = 1 if combo_bull else 0
+
+    score = _clamp(rsi_pts + stoch_pts + cci_pts + other_pts)
+
     reasons: List[str] = []
+    if rsi_pts == 2:
+        reasons.append(f"Osc: RSI {rsi_val:.1f} in 50-65 sweet spot")
+    elif rsi_pts == 1:
+        reasons.append(f"Osc: RSI {rsi_val:.1f} holding mid band")
+
+    if stoch_pts:
+        reasons.append(f"Osc: StochK {stoch_k:.1f} > 50")
+    if cci_pts:
+        reasons.append(f"Osc: CCI {cci:.0f} above {config.CCI_STRONG_THRESHOLD}")
+    if other_pts:
+        if stoch_rsi_bull:
+            reasons.append("Osc: StochRSI above 50 and rising")
+        else:
+            reasons.append("Osc: Williams%R + UO rising confirmation")
+
     details = {
         "rsi": rsi_val,
         "stoch_k": stoch_k,
         "cci": cci,
         "stoch_rsi": stoch_rsi,
+        "stoch_rsi_prev": stoch_rsi_prev,
         "williams_r": williams_r,
         "uo": uo,
+        "uo_prev": uo_prev,
     }
-
-    # Rule 1: RSI in Healthy Zone
-    rsi_healthy = config.RSI_HEALTHY_MIN <= rsi_val <= config.RSI_HEALTHY_MAX
-    details["rsi_healthy"] = rsi_healthy
-    if rsi_healthy:
-        score += OSC_WEIGHTS["rsi_healthy"]
-        reasons.append(
-            f"Osc: RSI={rsi_val:.1f} in 45-65 healthy range (sustainable trend)"
-        )
-    elif 30 <= rsi_val < config.RSI_HEALTHY_MIN:
-        score += OSC_WEIGHTS["rsi_recovery"]
-        reasons.append(f"Osc: RSI={rsi_val:.1f} emerging from oversold zone")
-
-    # Rule 2: Stochastic K
-    stoch_bullish = config.STOCH_OVERSOLD < stoch_k < config.STOCH_OVERBOUGHT and stoch_k >= 50
-    details["stoch_bullish"] = stoch_bullish
-    if stoch_bullish:
-        score += OSC_WEIGHTS["stoch_bullish"]
-        reasons.append(f"Osc: StochK={stoch_k:.1f} above 50 (bullish range)")
-    elif config.STOCH_OVERSOLD < stoch_k < 50:
-        score += OSC_WEIGHTS["stoch_mid"]
-        reasons.append(f"Osc: StochK={stoch_k:.1f} mid-range consolidation")
-    elif stoch_k <= config.STOCH_OVERSOLD:
-        reasons.append(f"Osc: StochK={stoch_k:.1f} oversold, watching for turn")
-
-    # Rule 3: CCI
-    cci_strong = cci > 100
-    details["cci_strong_bull"] = cci_strong
-    if cci_strong:
-        score += OSC_WEIGHTS["cci_strong"]
-        reasons.append(f"Osc: CCI={cci:.1f} strong bullish momentum")
-    elif cci > 0:
-        score += OSC_WEIGHTS["cci_positive"]
-        reasons.append(f"Osc: CCI={cci:.1f} above zero")
-
-    # Rule 4: Stochastic RSI
-    stoch_rsi_rising = stoch_rsi > 20
-    details["stoch_rsi_above_lower"] = stoch_rsi_rising
-    if stoch_rsi > 80:
-        score += OSC_WEIGHTS["stoch_rsi_high"]
-        reasons.append(f"Osc: StochRSI={stoch_rsi:.1f} staying strong above 80")
-    elif stoch_rsi_rising:
-        score += OSC_WEIGHTS["stoch_rsi_rising"]
-        reasons.append(f"Osc: StochRSI={stoch_rsi:.1f} rising from lower band")
-
-    # Rule 5: Williams %R
-    williams_bullish = williams_r > config.WILLIAMS_BULLISH
-    details["williams_bullish"] = williams_bullish
-    if williams_bullish:
-        score += OSC_WEIGHTS["williams_bullish"]
-        reasons.append(f"Osc: Williams%R={williams_r:.1f} bullish accumulation")
-    elif williams_r > -80:
-        score += OSC_WEIGHTS["williams_neutral"]
-        reasons.append(f"Osc: Williams%R={williams_r:.1f} neutral range")
-
-    # Rule 6: Ultimate Oscillator
-    if uo > config.UO_BULLISH:
-        score += OSC_WEIGHTS["uo_bullish"]
-        reasons.append(f"Osc: UO={uo:.1f} bullish drive")
-
-    return BlockScore(int(score), reasons[:4], details)
+    return BlockScore(score=int(score), reasons=reasons[:4], details=details)
 
 
 def compute_volume_block(
-    obv_trend: bool,
     bull_power: float,
     bear_power: float,
-    volume_spike: bool,
-    volume_spike_factor: Optional[float] = None,
-    obv_change_pct: float = 0.0,
+    volume_spike_factor: Optional[float],
+    obv_change_pct: float,
 ) -> BlockScore:
-    """
-    Volume/Power Block Scoring - REAL RULES
-    Components: OBV trend, Bull/Bear Power, Volume Spike
-    """
-    score = 0
+    """Volume & power block: spike + OBV + bull bear power."""
+    spike_pts = 0
+    if volume_spike_factor is not None:
+        if volume_spike_factor >= config.VOLUME_SPIKE_STRONG:
+            spike_pts = 2
+        elif volume_spike_factor >= config.VOLUME_SPIKE_MEDIUM:
+            spike_pts = 1
+
+    obv_pts = 0
+    if obv_change_pct >= config.OBV_UPTREND_MIN_PCT:
+        obv_pts = 2
+    elif obv_change_pct >= config.OBV_SIDEWAYS_MIN_PCT:
+        obv_pts = 1
+
+    power_pts = 1 if (bull_power > 0 and bear_power < 0) else 0
+
+    score = _clamp(spike_pts + obv_pts + power_pts)
+
     reasons: List[str] = []
+    if spike_pts == 2:
+        reasons.append(f"Vol: Volume spike {volume_spike_factor:.1f}x avg (strong)")
+    elif spike_pts == 1:
+        reasons.append(f"Vol: Volume spike {volume_spike_factor:.1f}x avg")
+
+    if obv_pts == 2:
+        reasons.append(
+            f"Vol: OBV up {obv_change_pct:.1f}%/{config.OBV_TREND_LOOKBACK} bars"
+        )
+    elif obv_pts == 1:
+        reasons.append("Vol: OBV tilting upward")
+
+    if power_pts:
+        reasons.append(
+            f"Vol: Bull power {bull_power:.4f} vs Bear {bear_power:.4f} (bull bias)"
+        )
+
     details = {
-        "obv_trend": obv_trend,
-        "obv_change_pct": obv_change_pct,
         "bull_power": bull_power,
         "bear_power": bear_power,
-        "volume_spike": volume_spike,
         "volume_spike_factor": volume_spike_factor,
+        "obv_change_pct": obv_change_pct,
     }
-
-    # Rule 1: OBV Uptrend
-    if obv_trend:
-        score += VOLUME_WEIGHTS["obv_uptrend"]
-        change_txt = (
-            f" ({obv_change_pct:+.1f}% over {config.OBV_TREND_LOOKBACK} bars)"
-            if obv_change_pct
-            else ""
-        )
-        reasons.append(
-            f"Vol: OBV in uptrend over last {config.OBV_TREND_LOOKBACK} bars" + change_txt
-        )
-
-    # Rule 2: Volume Spike
-    if volume_spike:
-        score += VOLUME_WEIGHTS["volume_spike"]
-        factor_txt = f" {volume_spike_factor:.1f}x" if volume_spike_factor else ""
-        reasons.append(
-            f"Vol: Volume spike{factor_txt} above {config.VOLUME_LOOKBACK}-bar average"
-        )
-
-    # Rule 3: Bull/Bear Power Analysis
-    if bull_power > 0 and bear_power < 0:
-        score += VOLUME_WEIGHTS["bull_domination"]
-        reasons.append(
-            f"Vol: Bulls dominating (Bull {bull_power:.4f} / Bear {bear_power:.4f})"
-        )
-    elif bull_power > 0:
-        score += VOLUME_WEIGHTS["bull_positive"]
-        reasons.append(f"Vol: Bull power positive ({bull_power:.4f})")
-
-    # Rule 4: Combined Volume Strength
-    if obv_trend and volume_spike:
-        score += VOLUME_WEIGHTS["obv_volume_confluence"]  # Bonus for confluence
-        reasons.append("Vol: OBV + volume spike confluence")
-
-    return BlockScore(int(score), reasons[:4], details)
+    return BlockScore(score=int(score), reasons=reasons[:4], details=details)
 
 
 def compute_price_action_block(pa_signals: dict) -> BlockScore:
-    """
-    Price Action Block Scoring - REAL RULES
-    Components: Candle patterns, volume confirmation, no collapse, EMA break
-    """
-    score = 0
-    reasons: List[str] = []
+    """Price-action scoring with collapse gate and EMA breakout tiers."""
     details = dict(pa_signals.get("details") or {})
-    volume_spike_factor = pa_signals.get("volume_spike_factor")
-
-    # Rule 1: Long Lower Wick (Hammer pattern)
-    if pa_signals.get('long_lower_wick', False):
-        score += PRICE_ACTION_WEIGHTS["long_lower_wick"]
-        wick_pct = details.get("lower_wick_pct")
-        if wick_pct is not None:
-            reasons.append(
-                f"PA: Hammer-type candle (lower wick {wick_pct:.1f}% of range)"
-            )
-        else:
-            reasons.append("PA: Hammer-type candle (long lower wick)")
-    
-    # Rule 2: Strong Green Candle
-    if pa_signals.get('strong_green', False):
-        score += PRICE_ACTION_WEIGHTS["strong_green"]
-        body_pct = details.get("body_pct_of_range")
-        if body_pct is not None:
-            reasons.append(
-                f"PA: Strong green body ({body_pct:.1f}% of range) closing near highs"
-            )
-        else:
-            reasons.append("PA: Strong green candle")
-    
-    # Rule 3: No Recent Collapse
-    if pa_signals.get('no_collapse', False):
-        score += PRICE_ACTION_WEIGHTS["no_collapse"]
+    collapse_ok = pa_signals.get("collapse_ok", True)
+    if not collapse_ok:
         drop_pct = details.get("max_drop_pct")
         if drop_pct is not None:
-            reasons.append(
-                f"PA: No sharp dump in last {config.COLLAPSE_LOOKBACK_BARS} candles (max drop {drop_pct:.1f}%)"
-            )
+            reasons = [
+                f"PA: Collapse {drop_pct:.1f}% in last {config.COLLAPSE_LOOKBACK_BARS} candles"
+            ]
         else:
-            reasons.append("PA: No major dumps recently")
-    
-    # Rule 4: EMA20 Breakout
-    if pa_signals.get('ema20_break', False):
-        score += PRICE_ACTION_WEIGHTS["ema20_break"]
-        reasons.append("PA: EMA20 breakout after closing below prior bar")
-    
-    # Rule 5: Volume Confirmation
-    if pa_signals.get('volume_spike', False) and pa_signals.get('min_volume', False):
-        score += PRICE_ACTION_WEIGHTS["volume_confirm"]
-        vol_txt = (
-            f"{volume_spike_factor:.1f}x spike"
-            if volume_spike_factor is not None
-            else "volume spike"
-        )
-        min_mult = details.get("min_volume_multiple")
-        if min_mult is not None and min_mult > 0:
-            reasons.append(
-                f"PA: {vol_txt} with liquidity {min_mult:.1f}x above minimum"
-            )
-        else:
-            reasons.append("PA: Volume confirms price action")
-    elif pa_signals.get('min_volume', False):
-        score += PRICE_ACTION_WEIGHTS["min_volume_only"]
-        reasons.append("PA: Minimum volume met")
+            reasons = ["PA: Recent collapse blocks score"]
+        return BlockScore(score=0, reasons=reasons, details=details)
 
-    return BlockScore(int(score), reasons[:4], details)
+    ema_pts = 0
+    if pa_signals.get("ema_breakout"):
+        ema_pts += 1
+    if pa_signals.get("ema_retest"):
+        ema_pts += 1
+
+    green_pts = 0
+    if pa_signals.get("very_strong_green"):
+        green_pts = 2
+    elif pa_signals.get("strong_green"):
+        green_pts = 1
+
+    wick_pts = 1 if pa_signals.get("long_lower_wick") else 0
+
+    score = _clamp(ema_pts + green_pts + wick_pts)
+
+    reasons: List[str] = []
+    if pa_signals.get("ema_breakout"):
+        reasons.append("PA: EMA20 breakout confirmed")
+    if pa_signals.get("ema_retest"):
+        reasons.append("PA: EMA20 retest + bounce")
+    if pa_signals.get("very_strong_green"):
+        reasons.append("PA: Very strong green impulse candle")
+    elif pa_signals.get("strong_green"):
+        reasons.append("PA: Strong green candle backing move")
+    if pa_signals.get("long_lower_wick"):
+        reasons.append("PA: Long lower wick support sweep")
+
+    return BlockScore(score=int(score), reasons=reasons[:4], details=details)
 
 
-def decide_signal_label(trend_block: BlockScore, osc_block: BlockScore,
-                       vol_block: BlockScore, pa_block: BlockScore,
-                       rsi_value: float, htf_trend_ok: bool,
-                       symbol: str) -> SignalResult:
-    """
-    Final Signal Decision Logic
-    Returns SignalResult with label: NONE, STRONG_BUY, or ULTRA_BUY
-    """
+def compute_htf_bonus(htf_context: Dict[str, Any]) -> BlockScore:
+    """1h higher-timeframe bonus: +1 each for close>EMA20, positive slope, MACD >= 0."""
+    close_above_ema = bool(htf_context.get("close_above_ema20"))
+    ema_slope_pct = float(htf_context.get("ema20_slope_pct", 0.0) or 0.0)
+    macd_hist = float(htf_context.get("macd_hist", 0.0) or 0.0)
+
+    bonus = 0
+    reasons: List[str] = []
+    if close_above_ema:
+        bonus += 1
+        reasons.append("HTF: 1h close above EMA20")
+    if ema_slope_pct > config.HTF_SLOPE_MIN_PCT:
+        bonus += 1
+        reasons.append(f"HTF: EMA20 slope {ema_slope_pct:+.2f}% rising")
+    if macd_hist >= 0:
+        bonus += 1
+        reasons.append("HTF: 1h MACD histogram >= 0")
+
+    details = {
+        "close_above_ema20": close_above_ema,
+        "ema20_slope_pct": ema_slope_pct,
+        "macd_hist": macd_hist,
+    }
+    return BlockScore(score=_clamp(bonus, ceiling=3), reasons=reasons[:3], details=details)
+
+
+def detect_risk(
+    meta: Optional[Dict[str, Any]],
+    trend_score: int,
+    vol_score: int,
+    osc_score: int,
+    pa_score: int,
+) -> Optional[str]:
+    meta = meta or {}
+    change = meta.get("price_change_pct")
+    if change is not None and change > config.RISK_LATE_PUMP_CHANGE:
+        return "LATE_PUMP"
+    if vol_score >= config.RISK_VOL_STRONG and trend_score <= config.RISK_TREND_WEAK:
+        return "PUMP_DUMP_RISK"
+    return "NORMAL"
+
+
+def decide_signal_label(
+    trend_block: BlockScore,
+    osc_block: BlockScore,
+    vol_block: BlockScore,
+    pa_block: BlockScore,
+    htf_block: Optional[BlockScore],
+    meta: Optional[Dict[str, Any]],
+    *,
+    rsi_value: float,
+    symbol: str,
+) -> SignalResult:
+    """Aggregate block scores and label outcome per revised thresholds."""
     trend_component = trend_block.score if config.ENABLE_TREND_BLOCK else 0
     osc_component = osc_block.score if config.ENABLE_OSC_BLOCK else 0
     vol_component = vol_block.score if config.ENABLE_VOLUME_BLOCK else 0
     pa_component = pa_block.score if config.ENABLE_PRICE_ACTION_BLOCK else 0
+    htf_bonus = htf_block.score if htf_block else 0
 
-    total_score = trend_component + osc_component + vol_component + pa_component
-    vol_pa_combined = vol_component + pa_component
-    
-    # Combine all reasons but respect block toggles for transparency
-    all_reasons: List[str] = []
+    score_core = trend_component + osc_component + vol_component + pa_component
+    score_total = score_core + htf_bonus
+
+    reasons: List[str] = []
     if config.ENABLE_TREND_BLOCK:
-        all_reasons.extend(trend_block.reasons)
+        reasons.extend(trend_block.reasons)
     if config.ENABLE_OSC_BLOCK:
-        all_reasons.extend(osc_block.reasons)
+        reasons.extend(osc_block.reasons)
     if config.ENABLE_VOLUME_BLOCK:
-        all_reasons.extend(vol_block.reasons)
+        reasons.extend(vol_block.reasons)
     if config.ENABLE_PRICE_ACTION_BLOCK:
-        all_reasons.extend(pa_block.reasons)
-    
-    # Default to no signal
-    label = "NONE"
-    
-    # ULTRA_BUY Conditions (Strictest)
-    if (total_score >= config.ULTRA_BUY_SCORE and
-        trend_component >= config.ULTRA_BUY_MIN_TREND and
-        osc_component >= config.ULTRA_BUY_MIN_OSC and
-        vol_pa_combined >= config.ULTRA_BUY_MIN_VOL_PA and
-        rsi_value <= config.ULTRA_BUY_MAX_RSI and
-        htf_trend_ok):  # Multi-timeframe confirmation required
-        label = "ULTRA_BUY"
-    
-    # STRONG_BUY Conditions
-    elif (total_score >= config.STRONG_BUY_SCORE and
-          trend_component >= config.STRONG_BUY_MIN_TREND and
-          osc_component >= config.STRONG_BUY_MIN_OSC and
-          vol_pa_combined >= config.STRONG_BUY_MIN_VOL_PA):
+        reasons.extend(pa_block.reasons)
+    if htf_block:
+        reasons.extend(htf_block.reasons)
+
+    label = "NO_SIGNAL"
+    if score_core < config.CORE_SCORE_WATCH_MIN:
+        label = "NO_SIGNAL"
+    elif score_core < config.CORE_SCORE_STRONG_MIN:
+        label = "WATCH"
+    elif (
+        score_core < config.CORE_SCORE_ULTRA_MIN
+        and trend_component >= config.TREND_MIN_FOR_STRONG
+        and vol_component >= config.VOL_MIN_FOR_STRONG
+    ):
         label = "STRONG_BUY"
-    
+    elif (
+        score_core >= config.CORE_SCORE_ULTRA_MIN
+        and trend_component >= config.TREND_MIN_FOR_ULTRA
+        and osc_component >= config.OSC_MIN_FOR_ULTRA
+        and vol_component >= config.VOL_MIN_FOR_ULTRA
+        and htf_bonus >= config.HTF_MIN_FOR_ULTRA
+    ):
+        label = "ULTRA_BUY"
+
+    risk_tag = detect_risk(meta, trend_component, vol_component, osc_component, pa_component)
+
     return SignalResult(
         symbol=symbol,
         trend_score=trend_component,
         osc_score=osc_component,
         vol_score=vol_component,
         pa_score=pa_component,
-        total_score=total_score,
+        htf_bonus=htf_bonus,
+        score_core=score_core,
+        score_total=score_total,
         label=label,
-        reasons=all_reasons[:5],  # Top 5 reasons
+        reasons=reasons[:5],
         rsi=rsi_value,
+        price=meta.get("price") if meta else 0.0,
+        price_change_pct=meta.get("price_change_pct") if meta else 0.0,
+        quote_volume=meta.get("quote_volume") if meta else 0.0,
+        risk_tag=risk_tag,
         trend_details=trend_block.details,
         osc_details=osc_block.details,
         vol_details=vol_block.details,
         pa_details=pa_block.details,
-        mtf_trend_confirmed=bool(
-            (trend_block.details or {}).get("mtf_trend_confirmed", False)
-        ),
-        htf_price_above_ema=htf_trend_ok,
-        fourh_price_above_ema20=bool(
-            (trend_block.details or {}).get("fourh_price_above_ema20", False)
-        ),
-        fourh_alignment_ok=bool(
-            (trend_block.details or {}).get("fourh_ema_alignment_ok", False)
-        ),
-        fourh_ema20_slope_pct=float(
-            (trend_block.details or {}).get("fourh_ema20_slope_pct", 0.0) or 0.0
-        ),
+        htf_details=htf_block.details if htf_block else None,
     )

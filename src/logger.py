@@ -22,7 +22,10 @@ _DEFAULT_COLUMNS = [
     "osc_score",
     "vol_score",
     "pa_score",
+    "score_core",
+    "htf_bonus",
     "total_score",
+    "risk_tag",
     "rsi",
     "price",
     "change_24h",
@@ -69,7 +72,10 @@ def log_signal_to_csv(
         "osc_score": signal.get("osc_score"),
         "vol_score": signal.get("vol_score"),
         "pa_score": signal.get("pa_score"),
-        "total_score": signal.get("total_score"),
+        "score_core": signal.get("score_core", signal.get("total_score")),
+        "htf_bonus": signal.get("htf_bonus"),
+        "total_score": signal.get("score_total", signal.get("total_score")),
+        "risk_tag": signal.get("risk_tag"),
         "rsi": signal.get("rsi"),
         "price": signal.get("price"),
         "change_24h": signal.get("price_change_pct"),
@@ -78,13 +84,16 @@ def log_signal_to_csv(
     }
 
     trend_details = signal.get("trend_details") or {}
+    htf_details = signal.get("htf_details") or {}
     vol_details = signal.get("vol_details") or {}
 
     htf_bits = []
-    if signal.get("mtf_trend_confirmed") or trend_details.get("mtf_trend_confirmed"):
-        htf_bits.append("1h-stack")
-    elif trend_details.get("htf_price_above_ema"):
+    if htf_details.get("close_above_ema20"):
         htf_bits.append("1h>EMA20")
+    if htf_details.get("ema20_slope_pct"):
+        htf_bits.append(f"1h-slope={float(htf_details['ema20_slope_pct']):+.1f}%")
+    if htf_details.get("macd_hist") is not None:
+        htf_bits.append(f"1h-MACD={float(htf_details['macd_hist']):+.3f}")
 
     if signal.get("fourh_alignment_ok"):
         htf_bits.append("4h-stack")

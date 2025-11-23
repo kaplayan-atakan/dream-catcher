@@ -11,10 +11,10 @@ TIMEFRAMES = ["15m", "1h", "4h"]
 MAIN_TIMEFRAME = "15m"
 
 # === PREFILTERS ===
-MIN_24H_QUOTE_VOLUME = 5_000_000  # $5M minimum volume
-MIN_PRICE_USDT = 0.02  # Filter penny stocks
-MIN_24H_CHANGE = -15.0  # Max 15% drop
-MAX_24H_CHANGE = 20.0  # Max 20% pump
+MIN_24H_QUOTE_VOLUME = 10_000_000  # $10M minimum volume per revised spec
+MIN_PRICE_USDT = 0.04  # Filter illiquid penny assets
+MIN_24H_CHANGE = -10.0  # Reject symbols dumping more than 10%
+MAX_24H_CHANGE = 20.0  # Reject symbols pumping beyond 20%
 
 # Signal Settings
 COOLDOWN_MINUTES = 60
@@ -34,17 +34,13 @@ RETRY_BACKOFF = 2
 LOG_CSV_PATH = "signals_log.csv"
 LOG_LEVEL = "INFO"
 
-# === SIGNAL THRESHOLDS ===
+# === SIGNAL THRESHOLDS (legacy, retained for telemetry) ===
 ULTRA_BUY_SCORE = 12
 STRONG_BUY_SCORE = 8
-
-# ULTRA_BUY Requirements
 ULTRA_BUY_MIN_TREND = 3
 ULTRA_BUY_MIN_OSC = 2
 ULTRA_BUY_MIN_VOL_PA = 3
 ULTRA_BUY_MAX_RSI = 65
-
-# STRONG_BUY Requirements
 STRONG_BUY_MIN_TREND = 2
 STRONG_BUY_MIN_OSC = 1
 STRONG_BUY_MIN_VOL_PA = 2
@@ -90,9 +86,53 @@ VOLUME_LOOKBACK = 20
 
 # Price Action
 MIN_BODY_PCT = 1.0  # 1% minimum candle body
-COLLAPSE_MAX_DROP_PCT = 12.0
+COLLAPSE_MAX_DROP_PCT = 20.0
 COLLAPSE_LOOKBACK_BARS = 96
 MIN_BAR_VOLUME_USDT = 10000
+EMA_BREAK_LOOKBACK = 10
+EMA_RETEST_LOOKBACK = 10
+EMA_NEAR_TOLERANCE = 0.01  # 1% proximity check for EMA20 retest detection
+EMA_SIMILARITY_TOLERANCE = 0.01  # EMA20 considered ~ EMA50 when within 1%
+STRONG_GREEN_BODY_MULTIPLIER = 1.5  # strong vs average body size
+STRONG_GREEN_LOOKBACK = 20
+LONG_WICK_MIN_RATIO = 0.40
+
+# Volume scoring helpers
+VOLUME_SPIKE_STRONG = 1.5
+VOLUME_SPIKE_MEDIUM = 1.2
+OBV_UPTREND_MIN_PCT = 2.0
+OBV_SIDEWAYS_MIN_PCT = 0.5
+BULL_POWER_DOMINANCE = 0.0  # Bull power must be > 0 and bear < 0 for bonus
+
+# Higher timeframe confirmation
+HTF_EMA_SLOPE_LOOKBACK = 5
+HTF_SLOPE_MIN_PCT = 0.0  # Slope must be non-negative for bonus
+
+# Risk tagging thresholds
+RISK_LATE_PUMP_CHANGE = 15.0
+RISK_VOL_STRONG = 3
+RISK_TREND_WEAK = 2
+
+# Core score thresholds (Phase 3 revised spec)
+CORE_SCORE_WATCH_MIN = 8
+CORE_SCORE_STRONG_MIN = 11
+CORE_SCORE_ULTRA_MIN = 14
+TREND_MIN_FOR_STRONG = 3
+VOL_MIN_FOR_STRONG = 2
+TREND_MIN_FOR_ULTRA = 4
+OSC_MIN_FOR_ULTRA = 3
+VOL_MIN_FOR_ULTRA = 3
+HTF_MIN_FOR_ULTRA = 2
+
+# Oscillator / momentum guardrails
+RSI_STRONG_MIN = 50
+RSI_STRONG_MAX = 65
+RSI_BUFFER_MIN = 45
+RSI_BUFFER_MAX = 70
+STOCH_K_MIDLINE = 50
+CCI_STRONG_THRESHOLD = 100
+STOCH_RSI_BULL_LEVEL = 50
+UO_RISING_MIN_DELTA = 0.5
 
 # Backtest
 BACKTEST_TP_PERCENTS = [2.0, 3.0, 5.0, 10.0]

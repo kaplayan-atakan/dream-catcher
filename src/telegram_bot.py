@@ -27,11 +27,14 @@ def format_signal_message(signal: Dict[str, object]) -> str:
     price = signal.get("price")
     change = signal.get("price_change_pct")
     quote_vol = signal.get("quote_volume")
-    label = signal.get("label", "NONE")
+    label = signal.get("label", "NO_SIGNAL")
     symbol = signal.get("symbol", "UNKNOWN")
     emoji = _LABEL_EMOJI.get(label, _DEFAULT_EMOJI)
     trend_details = signal.get("trend_details") or {}
     vol_details = signal.get("vol_details") or {}
+    core_score = signal.get("score_core", signal.get("total_score", 0))
+    htf_bonus = signal.get("htf_bonus", 0)
+    total_score = signal.get("score_total", signal.get("total_score", 0))
     lines = [
         f"{emoji} {label} - {symbol}",
         "• Price: {price:.4f} USDT | 24h: {change:+.2f}% | Vol: {vol:,.0f} USDT".format(
@@ -39,20 +42,25 @@ def format_signal_message(signal: Dict[str, object]) -> str:
             change=float(change) if change is not None else 0.0,
             vol=float(quote_vol) if quote_vol is not None else 0.0,
         ),
-        "• Scores: Trend={trend}, Osc={osc}, Vol={volb}, PA={pa}, Total={total}".format(
+        "• Scores: Trend={trend}, Osc={osc}, Vol={volb}, PA={pa} | Core={core} HTF+{htf} Total={total}".format(
             trend=signal.get("trend_score", 0),
             osc=signal.get("osc_score", 0),
             volb=signal.get("vol_score", 0),
             pa=signal.get("pa_score", 0),
-            total=signal.get("total_score", 0),
+            core=core_score,
+            htf=htf_bonus,
+            total=total_score,
         ),
     ]
 
     htf_bits = []
-    if signal.get("mtf_trend_confirmed") or trend_details.get("mtf_trend_confirmed"):
-        htf_bits.append("1h EMA stack ok")
-    elif trend_details.get("htf_price_above_ema"):
+    htf_details = signal.get("htf_details") or {}
+    if htf_details.get("close_above_ema20"):
         htf_bits.append("1h above EMA20")
+    if htf_details.get("ema20_slope_pct"):
+        htf_bits.append(f"1h EMA20 slope {float(htf_details['ema20_slope_pct']):+.1f}%")
+    if htf_details.get("macd_hist") is not None:
+        htf_bits.append(f"1h MACD {float(htf_details['macd_hist']):+.3f}")
 
     if signal.get("fourh_alignment_ok"):
         htf_bits.append("4h EMA stack ok")
@@ -85,6 +93,10 @@ def format_signal_message(signal: Dict[str, object]) -> str:
 
     if vol_bits:
         lines.append("• Volume: " + ", ".join(vol_bits[:3]))
+
+    risk_tag = signal.get("risk_tag")
+    if risk_tag and risk_tag != "NORMAL":
+        lines.append(f"• Risk: {risk_tag}")
 
     reasons = signal.get("reasons") or []
     if reasons:
