@@ -7,6 +7,7 @@ venv/
 .env.local
 *.log
 signals_log.csv
+data/
 .idea/
 .vscode/
 .DS_Store
