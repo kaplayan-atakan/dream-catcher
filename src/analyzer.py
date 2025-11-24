@@ -56,6 +56,7 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
         # Moving Averages
         ema20_values = indicators.ema(closes, config.EMA_FAST)
         ema50_values = indicators.ema(closes, config.EMA_SLOW)
+        ema60_values = indicators.ema(closes, config.MA60_PERIOD)
         
         # Trend Indicators
         adx_values, plus_di_values, minus_di_values = indicators.adx(
@@ -81,6 +82,7 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
         last_close = closes[-1]
         last_ema20 = ema20_values[-1] if ema20_values[-1] is not np.nan else None
         last_ema50 = ema50_values[-1] if ema50_values[-1] is not np.nan else None
+        last_ma60 = ema60_values[-1] if ema60_values[-1] is not np.nan else None
         
         # Trend indicators - latest
         last_adx = adx_values[-1] if adx_values[-1] is not np.nan else 0
@@ -110,6 +112,29 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
         last_uo_prev = None
         if len(uo_values) >= 2 and uo_values[-2] is not np.nan:
             last_uo_prev = uo_values[-2]
+
+        rsi_momentum_values = [np.nan] * len(rsi_values)
+        for idx in range(1, len(rsi_values)):
+            curr = rsi_values[idx]
+            prev = rsi_values[idx - 1]
+            if np.isnan(curr) or np.isnan(prev):
+                continue
+            rsi_momentum_values[idx] = curr - prev
+
+        rsi_momentum_current = None
+        if rsi_momentum_values and not np.isnan(rsi_momentum_values[-1]):
+            rsi_momentum_current = rsi_momentum_values[-1]
+
+        rsi_momentum_avg = None
+        lookback = config.RSI_MOMENTUM_LOOKBACK
+        if lookback > 0 and len(rsi_momentum_values) > lookback:
+            window = [
+                val
+                for val in rsi_momentum_values[-(lookback + 1) : -1]
+                if not np.isnan(val)
+            ]
+            if window:
+                rsi_momentum_avg = float(np.mean(window))
         
         # Volume indicators - latest
         obv_change_pct = indicators.obv_change_percent(obv_values, config.OBV_TREND_LOOKBACK)
@@ -137,9 +162,11 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
                     past_ema = htf_ema20[-(slope_lookback + 1)]
                     if past_ema:
                         htf_context["ema20_slope_pct"] = ((latest_ema20 / past_ema) - 1) * 100
-            _, _, htf_macd_hist = indicators.macd(htf_closes)
+            htf_macd_line, _, htf_macd_hist = indicators.macd(htf_closes)
             if htf_macd_hist and htf_macd_hist[-1] is not np.nan:
                 htf_context["macd_hist"] = htf_macd_hist[-1]
+            if htf_macd_line and htf_macd_line[-1] is not np.nan:
+                htf_context["macd_line"] = htf_macd_line[-1]
         
         fourh_context = {}
         if '4h' in klines_data and len(klines_data['4h']) >= 50:
@@ -234,6 +261,15 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
             "price_change_pct": symbol_data['price_change_pct'],
             "quote_volume": symbol_data['quote_volume'],
         }
+        pre_signal_context = {
+            "last_close": last_close,
+            "ma60": last_ma60,
+            "macd_1h": htf_context.get("macd_line"),
+            "rsi_value": last_rsi,
+            "rsi_momentum_curr": rsi_momentum_current,
+            "rsi_momentum_avg": rsi_momentum_avg,
+        }
+
         signal_result = rules.decide_signal_label(
             trend_block=trend_block,
             osc_block=osc_block,
@@ -243,6 +279,7 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
             meta=meta,
             rsi_value=last_rsi,
             symbol=symbol,
+            pre_signal_context=pre_signal_context,
         )
         
         # Add market data to result
@@ -253,6 +290,7 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
         signal_result.fourh_price_above_ema20 = ht4_price_above_ema20
         signal_result.fourh_alignment_ok = ht4_alignment
         signal_result.fourh_ema20_slope_pct = ht4_ema20_slope_pct
+        signal_result.bar_close_time = klines[-1].get('close_time')
         
         # Return only if we have a signal
         return signal_result.__dict__ if signal_result.label != "NO_SIGNAL" else None

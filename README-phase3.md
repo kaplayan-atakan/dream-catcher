@@ -184,7 +184,20 @@ Bu sayede:
 
 ---
 
-## 6. Faz 3 Teslim Kriterleri
+## 6. Backtest CLI Notları
+
+- Faz 3 testlerinde 15m ve 1h datasetleri artık ayrı dizinlerde tutuluyor; `src/backtest.py` çalıştırılırken `--data-dir-15m` ve `--data-dir-1h` parametrelerini birlikte ver.
+- Çoklu TP/SL varyasyonları için `--num-cycles` artırılarak daha geniş kombinasyon uzayı taranabilir.
+- Skor segmentlerini özelleştirmek için `--score-buckets` kullan; örn. `--score-buckets "7-8:mid,9-10,11+:top"`.
+- Uzun batch çalışmaları için örnek komut:
+
+```pwsh
+python -m src.backtest --data-dir-15m data/precomputed_15m --data-dir-1h data/precomputed_1h --symbols ALL --strategies fut_safe,fut_aggressive --num-cycles 30 --score-buckets "8-9,10-11,12+" --results-dir results/faz3
+```
+
+- Özet dosyası (`summary.md`) artık 15m/1h dizinlerini ve cycle sayısını ayrı satırlarda raporlar; uzun raporlar için bu alanları arşivle.
+
+## 7. Faz 3 Teslim Kriterleri
 
 - 4h timeframe verisi çekiliyor ve opsiyonel filter/fonksiyonlar için kullanılabilecek durumda.
 - Prefilter dinamik eşiğe uygun hale getirilebilecek altyapıya sahip (veya ilk versiyonu uygulanmış).

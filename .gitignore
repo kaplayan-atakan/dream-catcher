@@ -8,6 +8,8 @@ venv/
 *.log
 signals_log.csv
 data/
+#file:results
+results/
 .idea/
 .vscode/
 .DS_Store
