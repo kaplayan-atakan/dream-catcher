@@ -6,9 +6,28 @@ Configuration - Complete parameters for production
 BINANCE_BASE_URL = "https://api.binance.com"
 SYMBOL_FILTER_SUFFIX = "USDT"
 
+# Symbols to exclude entirely (stablecoins, etc.)
+STABLE_SYMBOLS = {
+    "USDCUSDT",
+    "BUSDUSDT",
+    "TUSDUSDT",
+    "DAIUSDT",
+    "USDPUSDT",
+    "GUSDUSDT",
+    "LUSDUSDT",
+    "USDEUSDT",
+    "USD1USDT",
+    "XUSDUSDT",
+    "FDUSDUSDT",
+    "USDSUSDT",      # bazı borsalarda stable
+    "EURSUSDT",      # euro stable (isteğe bağlı)
+    "BFUSDUSDT",
+}
+
 # Timeframes
 TIMEFRAMES = ["15m", "1h", "4h"]
 MAIN_TIMEFRAME = "15m"
+MAIN_TIMEFRAME_MINUTES = 15
 
 # === PREFILTERS ===
 MIN_24H_QUOTE_VOLUME = 10_000_000  # $10M minimum volume per revised spec
@@ -19,6 +38,18 @@ MAX_24H_CHANGE = 20.0  # Reject symbols pumping beyond 20%
 # Signal Settings
 COOLDOWN_MINUTES = 60
 MAX_SYMBOLS_PER_SCAN = 50  # Limit to top 50 by volume
+
+# Pre-signal gating filters
+MA60_PERIOD = 60
+RSI_PRE_FILTER_THRESHOLD = 55.0
+RSI_MOMENTUM_LOOKBACK = 10
+RSI_MOMENTUM_MIN_MULTIPLIER = 1.02
+MACD_1H_MIN_VALUE = 0.0
+
+# Post-signal validation
+POST_SIGNAL_TARGET_PCT = 1.5  # Require +1.5% within validation window
+POST_SIGNAL_MONITOR_BARS = 12
+POST_SIGNAL_BLOCK_MINUTES = 180
 
 # Telegram
 ENABLE_TELEGRAM = False  # Set True and add credentials

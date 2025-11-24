@@ -49,6 +49,8 @@ class SignalResult:
     fourh_price_above_ema20: bool = False
     fourh_alignment_ok: bool = False
     fourh_ema20_slope_pct: float = 0.0
+    bar_close_time: Optional[int] = None
+    filter_notes: Optional[List[str]] = None
     total_score: int = field(init=False)
 
     def __post_init__(self) -> None:
@@ -331,6 +333,7 @@ def decide_signal_label(
     *,
     rsi_value: float,
     symbol: str,
+    pre_signal_context: Optional[Dict[str, Any]] = None,
 ) -> SignalResult:
     """Aggregate block scores and label outcome per revised thresholds."""
     trend_component = trend_block.score if config.ENABLE_TREND_BLOCK else 0
@@ -374,6 +377,14 @@ def decide_signal_label(
     ):
         label = "ULTRA_BUY"
 
+    filter_notes: List[str] = []
+    label, filter_notes = _apply_pre_signal_filters(
+        label=label,
+        score_core=score_core,
+        rsi_value=rsi_value,
+        context=pre_signal_context or {},
+    )
+
     risk_tag = detect_risk(meta, trend_component, vol_component, osc_component, pa_component)
 
     return SignalResult(
@@ -397,4 +408,48 @@ def decide_signal_label(
         vol_details=vol_block.details,
         pa_details=pa_block.details,
         htf_details=htf_block.details if htf_block else None,
+        filter_notes=filter_notes or None,
     )
+
+
+def _apply_pre_signal_filters(
+    *,
+    label: str,
+    score_core: int,
+    rsi_value: float,
+    context: Dict[str, Any],
+) -> tuple[str, List[str]]:
+    """Downgrade STRONG/ULTRA labels when guardrails fail."""
+    if label not in {"STRONG_BUY", "ULTRA_BUY"}:
+        return label, []
+
+    notes: List[str] = []
+
+    close_price = context.get("last_close")
+    ma60 = context.get("ma60")
+    if close_price is not None and ma60 is not None and close_price < ma60:
+        notes.append("Filter: Price below MA60 on 15m")
+
+    macd_1h = context.get("macd_1h")
+    if macd_1h is not None and macd_1h < config.MACD_1H_MIN_VALUE:
+        notes.append("Filter: 1h MACD below zero")
+
+    if rsi_value is not None and rsi_value <= config.RSI_PRE_FILTER_THRESHOLD:
+        notes.append(
+            f"Filter: RSI {rsi_value:.1f} ≤ {config.RSI_PRE_FILTER_THRESHOLD:.0f}"
+        )
+
+    rsi_momentum_curr = context.get("rsi_momentum_curr")
+    rsi_momentum_avg = context.get("rsi_momentum_avg")
+    if (
+        rsi_momentum_curr is not None
+        and rsi_momentum_avg is not None
+        and rsi_momentum_curr <= rsi_momentum_avg * config.RSI_MOMENTUM_MIN_MULTIPLIER
+    ):
+        notes.append("Filter: RSI momentum not exceeding 10-bar avg")
+
+    if not notes:
+        return label, []
+
+    downgraded = "WATCH" if score_core >= config.CORE_SCORE_WATCH_MIN else "NO_SIGNAL"
+    return downgraded, notes

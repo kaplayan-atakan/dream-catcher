@@ -15,6 +15,7 @@ import data_fetcher
 import analyzer
 import telegram_bot
 import logger as log_module
+from signal_guard import SignalMonitor
 
 # Setup logging
 logger = log_module.setup_logger()
@@ -22,6 +23,7 @@ logger = log_module.setup_logger()
 # Global state
 last_signal_times: Dict[str, datetime] = {}
 active_symbols: Set[str] = set()
+signal_monitor = SignalMonitor()
 
 
 def _log_prefilter_density(total_pairs: int, kept_pairs: int) -> None:
@@ -104,6 +106,11 @@ async def scan_market(session: aiohttp.ClientSession) -> List[dict]:
                     prefilter_stats["non_usdt"] += 1
                     logger.debug("Skipping non-USDT ticker")
                     continue
+
+                symbol = parsed['symbol']
+                if symbol in config.STABLE_SYMBOLS:
+                    logger.debug("Skipping stablecoin %s", symbol)
+                    continue
                 
                 # PREFILTER 1: Minimum 24h volume
                 if parsed['quote_volume'] < config.MIN_24H_QUOTE_VOLUME:
@@ -121,7 +128,6 @@ async def scan_market(session: aiohttp.ClientSession) -> List[dict]:
                     continue
                 
                 # PREFILTER 4: Skip if in cooldown
-                symbol = parsed['symbol']
                 if symbol in last_signal_times:
                     time_since_signal = datetime.now() - last_signal_times[symbol]
                     if time_since_signal < timedelta(minutes=config.COOLDOWN_MINUTES):
@@ -253,6 +259,8 @@ async def main_loop():
                 
                 logger.info(f"\n🔍 Starting scan #{scan_count} at {scan_start.strftime('%H:%M:%S')}")
                 
+                await signal_monitor.evaluate_active_signals(session)
+
                 # Perform market scan
                 signals = await scan_market(session)
                 
@@ -262,12 +270,26 @@ async def main_loop():
                     
                     for signal in signals:
                         try:
+                            symbol = signal.get('symbol')
+                            if not symbol:
+                                logger.debug("Signal missing symbol, skipping")
+                                continue
+                            if symbol in config.STABLE_SYMBOLS:
+                                logger.debug("Ignoring stablecoin signal %s", symbol)
+                                continue
+
                             # Update cooldown
-                            symbol = signal['symbol']
                             last_signal_times[symbol] = datetime.now()
                             total_signals += 1
 
                             label = signal.get('label')
+                            blocked_reason = None
+                            if label in {"STRONG_BUY", "ULTRA_BUY"} and signal_monitor.is_symbol_blocked(symbol):
+                                blocked_reason = signal_monitor.get_block_reason(symbol) or "Post-signal block active"
+                                label = "WATCH"
+                                signal['label'] = label
+                                logger.info("Blocking STRONG/ULTRA for %s due to %s", symbol, blocked_reason)
+
                             should_notify = label in {"STRONG_BUY", "ULTRA_BUY"}
                             
                             # Log to CSV
@@ -310,6 +332,15 @@ async def main_loop():
                             risk_tag = signal.get('risk_tag')
                             if risk_tag and risk_tag != "NORMAL":
                                 logger.info("   Risk Tag: %s", risk_tag)
+                            if blocked_reason:
+                                logger.info("   Block Reason: %s", blocked_reason)
+                            filter_notes = signal.get('filter_notes')
+                            if filter_notes:
+                                for note in filter_notes:
+                                    logger.info("   %s", note)
+
+                            if should_notify:
+                                signal_monitor.register_signal(signal)
                             
                         except Exception as e:
                             logger.error(f"Error processing signal: {e}")

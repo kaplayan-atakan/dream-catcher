@@ -193,6 +193,21 @@ Faz 2’de:
 - Multi-timeframe:
   - Şimdilik 15m & 1h aktif, 4h ileride (Faz 3’te) kullanılacak; Faz 2’de sadece koda **hazırlık** (4h verisini de `data_fetcher` içine almak, analyzer’da istersen yorumlayıp loglamak) yapılabilir.
 
+## 5.1. Backtest CLI Notları
+
+- `src/backtest.py` artık iki ayrı veri dizinini ister:
+  - `--data-dir-15m` (varsayılan `data/precomputed_15m`)
+  - `--data-dir-1h` (varsayılan `data/precomputed_1h`)
+- Faz 2’de TP/SL karıştırmasını (cycle) artırmak için yeni `--num-cycles` bayrağı eklendi; varsayılan 10’dur.
+- Skor kovalarını raporlamak üzere `--score-buckets` argümanı kullanılabilir. Örnek: `--score-buckets "8-9:balanced,10-11,12+:hi"`.
+- Örnek komut:
+
+```pwsh
+python -m src.backtest --data-dir-15m data/precomputed_15m --data-dir-1h data/precomputed_1h --strategies fut_safe,fut_balanced --symbols BTCUSDT,ETHUSDT --num-cycles 20 --score-buckets "8-9,10-11,12+"
+```
+
+Bu komut her strateji için 20 cycle çalıştırır ve özelleştirilmiş skor kovalarıyla sonuçları özetler.
+
 ---
 
 ## 6. Faz 2 Teslim Kriterleri
