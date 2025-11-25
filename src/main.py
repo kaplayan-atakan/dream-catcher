@@ -15,7 +15,7 @@ import data_fetcher
 import analyzer
 import telegram_bot
 import logger as log_module
-from signal_guard import SignalMonitor
+from signal_guard import SignalMonitor, SignalFailureEvent
 
 # Setup logging
 logger = log_module.setup_logger()
@@ -24,6 +24,33 @@ logger = log_module.setup_logger()
 last_signal_times: Dict[str, datetime] = {}
 active_symbols: Set[str] = set()
 signal_monitor = SignalMonitor()
+
+
+def _describe_failure_event(event: SignalFailureEvent) -> str:
+    if event.reason_code == "first_bar_failed":
+        core_msg = "first 15m bar after signal did not confirm (close<=open)"
+        status = "CANCELLED"
+    elif event.reason_code == "follow_through_timeout":
+        core_msg = "+1.5% target not reached within 12x15m bars"
+        status = "INVALIDATED"
+    else:
+        core_msg = event.description
+        status = "FAILED"
+    expiry_str = event.block_expires_at.strftime("%H:%M UTC")
+    return f"[{event.symbol}] {event.label} signal {status}: {core_msg}. Blocked until {expiry_str}."
+
+
+async def _handle_post_signal_failures(events: List[SignalFailureEvent], in_warmup: bool) -> None:
+    if not events:
+        return
+    for event in events:
+        message = _describe_failure_event(event)
+        logger.warning(message)
+        if config.ENABLE_TELEGRAM and not in_warmup:
+            try:
+                await telegram_bot.send_telegram_message(message)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to send Telegram failure alert for %s: %s", event.symbol, exc)
 
 
 def _log_prefilter_density(total_pairs: int, kept_pairs: int) -> None:
@@ -226,13 +253,13 @@ async def main_loop():
     warmup_notice_logged = False
     warmup_complete_logged = False
 
-    # if config.ENABLE_TELEGRAM:
-    #     try:
-    #         await telegram_bot.send_telegram_message(
-    #             "Hadi, başlıyorum! Hazır mıyız? Time to fly 🚀"
-    #         )
-    #     except Exception as exc:  # noqa: BLE001
-    #         logger.warning(f"Failed to send Telegram start message: {exc}")
+    if config.ENABLE_TELEGRAM:
+        try:
+            await telegram_bot.send_telegram_message(
+                "Hadi, başlıyorum! Time to fly 🚀"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Failed to send Telegram start message: {exc}")
     
     # Create persistent session with connection pooling
     connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
@@ -260,6 +287,9 @@ async def main_loop():
                 logger.info(f"\n🔍 Starting scan #{scan_count} at {scan_start.strftime('%H:%M:%S')}")
                 
                 await signal_monitor.evaluate_active_signals(session)
+                failure_events = signal_monitor.drain_failure_events()
+                if failure_events:
+                    await _handle_post_signal_failures(failure_events, in_warmup)
 
                 # Perform market scan
                 signals = await scan_market(session)

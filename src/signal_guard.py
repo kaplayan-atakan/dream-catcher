@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import config
 import data_fetcher
@@ -30,6 +30,16 @@ class ActiveSignalState:
     first_bar_passed: bool = False
 
 
+@dataclass(frozen=True)
+class SignalFailureEvent:
+    symbol: str
+    label: str
+    reason_code: str
+    description: str
+    signal_close_time: int
+    block_expires_at: datetime
+
+
 class SignalMonitor:
     """Tracks active signals and enforces post-signal filters (Filters 2 & 3)."""
 
@@ -37,6 +47,7 @@ class SignalMonitor:
         self.active: Dict[str, ActiveSignalState] = {}
         self.blocked_until: Dict[str, datetime] = {}
         self.block_reasons: Dict[str, str] = {}
+        self._failure_events: List[SignalFailureEvent] = []
 
     def is_symbol_blocked(self, symbol: str) -> bool:
         now = datetime.utcnow()
@@ -53,22 +64,31 @@ class SignalMonitor:
             return None
         return self.block_reasons.get(symbol)
 
+    def drain_failure_events(self) -> List[SignalFailureEvent]:
+        events = list(self._failure_events)
+        self._failure_events.clear()
+        return events
+
     def register_signal(self, signal: dict) -> None:
         """Start monitoring a freshly emitted STRONG/ULTRA signal."""
         symbol = signal.get("symbol")
+        label = (signal.get("label") or "").upper()
+        if label not in {"STRONG_BUY", "ULTRA_BUY"}:
+            return
         price = float(signal.get("price") or 0.0)
         close_time = signal.get("bar_close_time")
         if not symbol or not close_time or price <= 0:
             return
 
-        target_multiplier = 1 + (config.POST_SIGNAL_TARGET_PCT / 100.0)
+        target_multiplier = getattr(config, "FOLLOW_THROUGH_TARGET_MULTIPLIER", 1.015)
         target_price = price * target_multiplier
-        deadline_close_time = close_time + (config.POST_SIGNAL_MONITOR_BARS * BAR_INTERVAL_MS)
+        monitor_bars = getattr(config, "FOLLOW_THROUGH_BARS", config.POST_SIGNAL_MONITOR_BARS)
+        deadline_close_time = close_time + (monitor_bars * BAR_INTERVAL_MS)
         first_bar_deadline = close_time + BAR_INTERVAL_MS
 
         self.active[symbol] = ActiveSignalState(
             symbol=symbol,
-            label=signal.get("label", "STRONG_BUY"),
+            label=label,
             price=price,
             target_price=target_price,
             emitted_at=datetime.utcnow(),
@@ -112,16 +132,22 @@ class SignalMonitor:
         if state.first_bar_checked:
             return
 
-        next_bar = next((bar for bar in bars if bar.get("close_time") > state.signal_close_time), None)
+        next_bar = next((bar for bar in bars if int(bar.get("close_time") or 0) > state.signal_close_time), None)
         if not next_bar:
             return
 
         state.first_bar_checked = True
-        if next_bar.get("close", 0.0) > next_bar.get("open", 0.0):
+        next_open = float(next_bar.get("open") or 0.0)
+        next_close = float(next_bar.get("close") or 0.0)
+        if next_close > next_open:
             state.first_bar_passed = True
             return
 
-        self._mark_failure(state.symbol, "First 15m bar failed to close green")
+        self._mark_failure(
+            state,
+            reason_code="first_bar_failed",
+            description="First 15m bar after signal closed <= open (no confirmation)",
+        )
 
     def _evaluate_price_target(self, state: ActiveSignalState, bars: list[dict]) -> None:
         for bar in bars:
@@ -138,16 +164,32 @@ class SignalMonitor:
 
         latest_close_time = int(bars[-1].get("close_time") or 0)
         if latest_close_time > state.deadline_close_time:
-            self._mark_failure(state.symbol, "+1.5% target not reached within 12 bars")
+            self._mark_failure(
+                state,
+                reason_code="follow_through_timeout",
+                description="+1.5% target not reached within validation window",
+            )
 
-    def _mark_failure(self, symbol: str, reason: str) -> None:
+    def _mark_failure(self, state: ActiveSignalState, reason_code: str, description: str) -> None:
+        symbol = state.symbol
         self.active.pop(symbol, None)
-        block_until = datetime.utcnow() + timedelta(minutes=config.POST_SIGNAL_BLOCK_MINUTES)
+        block_minutes = getattr(config, "BLOCK_DURATION_MINUTES", config.POST_SIGNAL_BLOCK_MINUTES)
+        block_until = datetime.utcnow() + timedelta(minutes=block_minutes)
         self.blocked_until[symbol] = block_until
-        self.block_reasons[symbol] = reason
+        self.block_reasons[symbol] = description
+        self._failure_events.append(
+            SignalFailureEvent(
+                symbol=symbol,
+                label=state.label,
+                reason_code=reason_code,
+                description=description,
+                signal_close_time=state.signal_close_time,
+                block_expires_at=block_until,
+            )
+        )
         logger.warning(
             "Post-signal block applied to %s until %s (%s)",
             symbol,
             block_until.strftime("%H:%M"),
-            reason,
+            description,
         )
