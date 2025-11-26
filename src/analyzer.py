@@ -265,6 +265,7 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
             "last_close": last_close,
             "ma60": last_ma60,
             "macd_1h": htf_context.get("macd_line"),
+            "macd_hist_1h": htf_context.get("macd_hist"),
             "rsi_value": last_rsi,
             "rsi_momentum_curr": rsi_momentum_current,
             "rsi_momentum_avg": rsi_momentum_avg,

@@ -430,9 +430,9 @@ def _apply_pre_signal_filters(
     if close_price is not None and ma60 is not None and close_price < ma60:
         notes.append("Filter: Price below MA60 on 15m")
 
-    macd_1h = context.get("macd_1h")
-    if macd_1h is not None and macd_1h < config.MACD_1H_MIN_VALUE:
-        notes.append("Filter: 1h MACD below zero")
+    macd_hist_1h = context.get("macd_hist_1h")
+    if macd_hist_1h is not None and macd_hist_1h < config.MACD_1H_HIST_MIN_VALUE:
+        notes.append("Filter: 1h MACD histogram below zero")
 
     if rsi_value is not None and rsi_value <= config.RSI_PRE_FILTER_THRESHOLD:
         notes.append(
