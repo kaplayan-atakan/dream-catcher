@@ -458,9 +458,9 @@ def _apply_pre_signal_filters(
         parabolic = pa_details.get("parabolic_runup", False)
         runup_pct = pa_details.get("runup_from_recent_low_pct", 0.0)
 
-        if overextended:
+        if getattr(config, "ENABLE_OVEREXTENSION_FILTER", True) and overextended:
             notes.append(f"Filter: Overextended (+{dist_pct:.2f}% vs EMA20)")
-        if parabolic:
+        if getattr(config, "ENABLE_PARABOLIC_SPIKE_FILTER", True) and parabolic:
             notes.append(f"Filter: Parabolic runup (+{runup_pct:.2f}% from low)")
 
     # === REVIZYON 2.1: CANDLE DIRECTION GUARD (last 15m bar must be green) ===
@@ -488,14 +488,14 @@ def _apply_pre_signal_filters(
     # === REVIZYON 2.3: LOCAL BOTTOM DETECTION ===
     if getattr(config, "ENABLE_LOCAL_BOTTOM_FILTER", False):
         closes_15m = context.get("recent_closes_15m") or []
-        lookback = getattr(config, "LOCAL_BOTTOM_LOOKBACK", 10)
+        lookback = getattr(config, "LOCAL_BOTTOM_LOOKBACK", 8)
         if len(closes_15m) >= lookback:
             last_n = closes_15m[-lookback:]
             if len(last_n) >= 2:
                 penultimate = last_n[-2]
                 last_close_val = last_n[-1]
                 if penultimate != min(last_n):
-                    notes.append("Filter: No local bottom detected in last 10 bars")
+                    notes.append(f"Filter: No local bottom detected in last {lookback} bars")
                 elif last_close_val <= penultimate:
                     notes.append("Filter: No bounce after local bottom")
 
