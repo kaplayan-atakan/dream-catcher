@@ -48,7 +48,7 @@ Type=simple
 User=${BOT_USER}
 WorkingDirectory=${WORKING_DIR}
 Environment=PYTHONUNBUFFERED=1
-ExecStart=${PYTHON_BIN} -m src.main
+ExecStart=${PYTHON_BIN} src/main.py
 Restart=on-failure
 RestartSec=5
 
