@@ -69,6 +69,24 @@ def analyze_price_action(
         volume_val / config.MIN_BAR_VOLUME_USDT if config.MIN_BAR_VOLUME_USDT > 0 else 0
     )
 
+    # === LATE SPIKE / OVEREXTENSION METRICS (Revizyon 1) ===
+    ema_last = ema20_values[-1] if ema20_values and ema20_values[-1] is not np.nan else None
+    dist_from_ema_pct = 0.0
+    overextended_vs_ema = False
+    if ema_last and ema_last > 0:
+        dist_from_ema_pct = (close_val - ema_last) / ema_last * 100
+        overextended_vs_ema = dist_from_ema_pct >= config.LATE_PUMP_EMA_DIST_PCT
+
+    exhaustion_lookback = getattr(config, "EXHAUSTION_LOOKBACK", 8)
+    runup_from_recent_low_pct = 0.0
+    parabolic_runup = False
+    if len(closes) >= exhaustion_lookback:
+        recent_window = closes[-exhaustion_lookback:]
+        recent_low = min(recent_window) if recent_window else close_val
+        if recent_low and recent_low > 0:
+            runup_from_recent_low_pct = (close_val / recent_low - 1.0) * 100
+            parabolic_runup = runup_from_recent_low_pct >= config.LATE_PUMP_RUNUP_PCT
+
     pa_details = {
         "body_pct_vs_open": body_pct_vs_open,
         "body_pct_of_range": body_pct_of_range,
@@ -80,6 +98,10 @@ def analyze_price_action(
         "avg_volume": avg_volume,
         "current_volume": volume_val,
         "min_volume_multiple": min_volume_multiple,
+        "overextended_vs_ema": overextended_vs_ema,
+        "parabolic_runup": parabolic_runup,
+        "dist_from_ema_pct": dist_from_ema_pct,
+        "runup_from_recent_low_pct": runup_from_recent_low_pct,
     }
 
     return {

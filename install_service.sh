@@ -19,6 +19,11 @@ ensure_logs_dir() {
   fi
 }
 
+fix_ownership() {
+  info "Fixing ownership of ${REPO_ROOT} for user ${BOT_USER}"
+  chown -R "${BOT_USER}:${BOT_USER}" "${REPO_ROOT}"
+}
+
 create_venv() {
   if [[ ! -d "${REPO_ROOT}/.venv" ]]; then
     info "Creating Python virtual environment at ${REPO_ROOT}/.venv"
@@ -65,6 +70,7 @@ main() {
   info "Repository root detected at ${REPO_ROOT}"
   ensure_logs_dir
   create_venv
+  fix_ownership
   write_service_file
   reload_and_enable
   printf '\nService installed as %s.\n' "${SERVICE_NAME}"

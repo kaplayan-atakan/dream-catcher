@@ -1,0 +1,2514 @@
+===== src\main.py =====
+"""
+Binance USDT Signal Bot - Main Module
+Complete implementation with prefilters, cooldown, and error handling
+"""
+
+import asyncio
+import aiohttp
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Set
+
+# Import modules
+import config
+import data_fetcher
+import analyzer
+import telegram_bot
+import logger as log_module
+from signal_guard import SignalMonitor, SignalFailureEvent
+
+# Setup logging
+logger = log_module.setup_logger()
+
+# Global state
+last_signal_times: Dict[str, datetime] = {}
+active_symbols: Set[str] = set()
+signal_monitor = SignalMonitor()
+
+
+def _describe_failure_event(event: SignalFailureEvent) -> str:
+    if event.reason_code == "first_bar_failed":
+        core_msg = "first 15m bar after signal did not confirm (close<=open)"
+        status = "CANCELLED"
+    elif event.reason_code == "follow_through_timeout":
+        core_msg = "+1.5% target not reached within 12x15m bars"
+        status = "INVALIDATED"
+    else:
+        core_msg = event.description
+        status = "FAILED"
+    expiry_str = event.block_expires_at.strftime("%H:%M UTC")
+    return f"[{event.symbol}] {event.label} signal {status}: {core_msg}. Blocked until {expiry_str}."
+
+
+async def _handle_post_signal_failures(events: List[SignalFailureEvent], in_warmup: bool) -> None:
+    if not events:
+        return
+    for event in events:
+        message = _describe_failure_event(event)
+        logger.warning(message)
+        if config.ENABLE_TELEGRAM and not in_warmup:
+            try:
+                await telegram_bot.send_telegram_message(message)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to send Telegram failure alert for %s: %s", event.symbol, exc)
+
+
+def _log_prefilter_density(total_pairs: int, kept_pairs: int) -> None:
+    """Emit Phase 3 transparency hints about how strict the current filters are."""
+    if total_pairs <= 0:
+        return
+    keep_ratio = kept_pairs / total_pairs
+    logger.info(
+        "Prefilter keep ratio: %.2f%% (%d/%d)", keep_ratio * 100, kept_pairs, total_pairs
+    )
+
+    # Hooks for future dynamic thresholds – for now we only surface guidance to operators.
+    if keep_ratio > 0.20:
+        logger.info(
+            "Prefilter note: High candidate density detected; future runs may tighten volume/change gates"
+        )
+    elif keep_ratio < 0.02:
+        logger.info(
+            "Prefilter note: Very few candidates surviving; future runs may relax thresholds slightly"
+        )
+
+
+async def process_symbol_batch(session: aiohttp.ClientSession, 
+                              symbols: List[dict], 
+                              semaphore: asyncio.Semaphore) -> List[dict]:
+    """Process a batch of symbols with concurrency control"""
+    async def analyze_with_limit(symbol_data):
+        async with semaphore:
+            try:
+                return await analyzer.analyze_symbol(session, symbol_data)
+            except Exception as e:
+                logger.error(f"Error analyzing {symbol_data.get('symbol')}: {e}")
+                return None
+    
+    tasks = [analyze_with_limit(s) for s in symbols]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Filter out errors and None results
+    valid_results = []
+    for result in results:
+        if isinstance(result, Exception):
+            logger.error(f"Task exception: {result}")
+        elif result is not None:
+            valid_results.append(result)
+    
+    return valid_results
+
+
+async def scan_market(session: aiohttp.ClientSession) -> List[dict]:
+    """
+    Main market scanning function
+    Applies prefilters and generates signals
+    """
+    try:
+        # Step 1: Fetch 24h tickers
+        logger.info("Fetching 24h ticker data...")
+        tickers = await data_fetcher.fetch_24h_tickers(session)
+        
+        if not tickers:
+            logger.warning("No tickers fetched from Binance")
+            return []
+        
+        logger.info(f"Fetched {len(tickers)} USDT pairs")
+        
+        # Step 2: Parse and apply PREFILTERS
+        filtered_symbols = []
+        prefilter_stats = {
+            "non_usdt": 0,
+            "volume": 0,
+            "price": 0,
+            "change": 0,
+            "cooldown": 0,
+        }
+        
+        for ticker in tickers:
+            try:
+                # Parse ticker data
+                parsed = data_fetcher.parse_ticker_data(ticker)
+                if parsed is None:
+                    prefilter_stats["non_usdt"] += 1
+                    logger.debug("Skipping non-USDT ticker")
+                    continue
+
+                symbol = parsed['symbol']
+                if symbol in config.STABLE_SYMBOLS:
+                    logger.debug("Skipping stablecoin %s", symbol)
+                    continue
+                
+                # PREFILTER 1: Minimum 24h volume
+                if parsed['quote_volume'] < config.MIN_24H_QUOTE_VOLUME:
+                    prefilter_stats["volume"] += 1
+                    continue
+                
+                # PREFILTER 2: Minimum price
+                if parsed['price'] < config.MIN_PRICE_USDT:
+                    prefilter_stats["price"] += 1
+                    continue
+                
+                # PREFILTER 3: 24h price change range
+                if not (config.MIN_24H_CHANGE <= parsed['price_change_pct'] <= config.MAX_24H_CHANGE):
+                    prefilter_stats["change"] += 1
+                    continue
+                
+                # PREFILTER 4: Skip if in cooldown
+                if symbol in last_signal_times:
+                    time_since_signal = datetime.now() - last_signal_times[symbol]
+                    if time_since_signal < timedelta(minutes=config.COOLDOWN_MINUTES):
+                        logger.debug(f"Skipping {symbol} - in cooldown ({time_since_signal.seconds//60} min)")
+                        prefilter_stats["cooldown"] += 1
+                        continue
+                
+                filtered_symbols.append(parsed)
+                
+            except Exception as e:
+                logger.error(f"Error parsing ticker: {e}")
+                continue
+        
+        logger.info(
+            "Prefilter summary - kept: %d | volume: %d | price: %d | change: %d | cooldown: %d | non-USDT: %d",
+            len(filtered_symbols),
+            prefilter_stats["volume"],
+            prefilter_stats["price"],
+            prefilter_stats["change"],
+            prefilter_stats["cooldown"],
+            prefilter_stats["non_usdt"],
+        )
+        _log_prefilter_density(len(tickers), len(filtered_symbols))
+        
+        # Step 3: Limit symbols if configured
+        if config.MAX_SYMBOLS_PER_SCAN and len(filtered_symbols) > config.MAX_SYMBOLS_PER_SCAN:
+            # Sort by volume and take top N
+            filtered_symbols.sort(key=lambda x: x['quote_volume'], reverse=True)
+            filtered_symbols = filtered_symbols[:config.MAX_SYMBOLS_PER_SCAN]
+            logger.info(f"Limited to top {config.MAX_SYMBOLS_PER_SCAN} symbols by volume")
+        
+        # Step 4: Analyze symbols with concurrency control
+        semaphore = asyncio.Semaphore(10)  # Max 10 concurrent API calls
+        
+        # Process in batches to avoid overwhelming the API
+        batch_size = 20
+        all_signals = []
+        
+        for i in range(0, len(filtered_symbols), batch_size):
+            batch = filtered_symbols[i:i + batch_size]
+            logger.info(f"Processing batch {i//batch_size + 1}/{(len(filtered_symbols)-1)//batch_size + 1}")
+            
+            batch_results = await process_symbol_batch(session, batch, semaphore)
+            all_signals.extend(batch_results)
+            
+            # Small delay between batches
+            if i + batch_size < len(filtered_symbols):
+                await asyncio.sleep(1)
+        
+        # Step 5: Filter for actual signals (exclude NO_SIGNAL)
+        valid_signals = [s for s in all_signals if s and s.get('label') != 'NO_SIGNAL']
+        
+        return valid_signals
+        
+    except Exception as e:
+        logger.error(f"Market scan error: {e}")
+        return []
+
+
+async def main_loop():
+    """Main bot loop with proper error handling"""
+    logger.info("=" * 60)
+    logger.info("🚀 Starting Binance USDT Signal Bot")
+    logger.info("=" * 60)
+    logger.info("Configuration:")
+    logger.info(f"  • Min 24h Volume: ${config.MIN_24H_QUOTE_VOLUME:,.0f}")
+    logger.info(f"  • 24h Change Range: {config.MIN_24H_CHANGE}% to {config.MAX_24H_CHANGE}%")
+    logger.info(f"  • Min Price: ${config.MIN_PRICE_USDT}")
+    logger.info("  • Core Score Thresholds:")
+    logger.info(
+        "    - WATCH when core ≥ %d (below this = NO_SIGNAL)",
+        config.CORE_SCORE_WATCH_MIN,
+    )
+    logger.info(
+        "    - STRONG_BUY when core ≥ %d with Trend≥%d & Vol≥%d",
+        config.CORE_SCORE_STRONG_MIN,
+        config.TREND_MIN_FOR_STRONG,
+        config.VOL_MIN_FOR_STRONG,
+    )
+    logger.info(
+        "    - ULTRA_BUY when core ≥ %d plus Trend≥%d, Osc≥%d, Vol≥%d, HTF≥%d",
+        config.CORE_SCORE_ULTRA_MIN,
+        config.TREND_MIN_FOR_ULTRA,
+        config.OSC_MIN_FOR_ULTRA,
+        config.VOL_MIN_FOR_ULTRA,
+        config.HTF_MIN_FOR_ULTRA,
+    )
+    logger.info(f"  • Cooldown: {config.COOLDOWN_MINUTES} minutes")
+    logger.info(f"  • Telegram: {'✅ Enabled' if config.ENABLE_TELEGRAM else '❌ Disabled'}")
+    logger.info(f"  • Main Timeframe: {config.MAIN_TIMEFRAME}")
+    logger.info(f"  • Multi-timeframe: {', '.join(config.TIMEFRAMES)}")
+    logger.info("=" * 60)
+
+    start_time = datetime.now()
+    warmup_duration = timedelta(minutes=3)
+    warmup_notice_logged = False
+    warmup_complete_logged = False
+
+    if config.ENABLE_TELEGRAM:
+        try:
+            await telegram_bot.send_telegram_message(
+                "Hadi, başlıyorum! Time to fly 🚀"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Failed to send Telegram start message: {exc}")
+    
+    # Create persistent session with connection pooling
+    connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
+    timeout = aiohttp.ClientTimeout(total=60, connect=10)
+    
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        scan_count = 0
+        total_signals = 0
+        
+        while True:
+            try:
+                scan_count += 1
+                scan_start = datetime.now()
+                elapsed = datetime.now() - start_time
+                in_warmup = elapsed < warmup_duration
+
+                if config.ENABLE_TELEGRAM:
+                    if in_warmup and not warmup_notice_logged:
+                        logger.info("Skipping Telegram sends during warmup window (first 3 minutes)")
+                        warmup_notice_logged = True
+                    elif not in_warmup and not warmup_complete_logged:
+                        logger.info("Warmup complete; Telegram notifications enabled")
+                        warmup_complete_logged = True
+                
+                logger.info(f"\n🔍 Starting scan #{scan_count} at {scan_start.strftime('%H:%M:%S')}")
+                
+                await signal_monitor.evaluate_active_signals(session)
+                failure_events = signal_monitor.drain_failure_events()
+                if failure_events:
+                    await _handle_post_signal_failures(failure_events, in_warmup)
+
+                # Perform market scan
+                signals = await scan_market(session)
+                
+                # Process signals
+                if signals:
+                    logger.info(f"✨ Generated {len(signals)} signals!")
+                    
+                    for signal in signals:
+                        try:
+                            symbol = signal.get('symbol')
+                            if not symbol:
+                                logger.debug("Signal missing symbol, skipping")
+                                continue
+                            if symbol in config.STABLE_SYMBOLS:
+                                logger.debug("Ignoring stablecoin signal %s", symbol)
+                                continue
+
+                            # Update cooldown
+                            last_signal_times[symbol] = datetime.now()
+                            total_signals += 1
+
+                            label = signal.get('label')
+                            blocked_reason = None
+                            if label in {"STRONG_BUY", "ULTRA_BUY"} and signal_monitor.is_symbol_blocked(symbol):
+                                blocked_reason = signal_monitor.get_block_reason(symbol) or "Post-signal block active"
+                                label = "WATCH"
+                                signal['label'] = label
+                                logger.info("Blocking STRONG/ULTRA for %s due to %s", symbol, blocked_reason)
+
+                            should_notify = label in {"STRONG_BUY", "ULTRA_BUY"}
+                            
+                            # Log to CSV
+                            log_module.log_signal_to_csv(
+                                path=config.LOG_CSV_PATH,
+                                signal=signal,
+                                extra_fields={
+                                    'price': signal.get('price'),
+                                    'change_24h': signal.get('price_change_pct'),
+                                    'quote_vol_24h': signal.get('quote_volume'),
+                                }
+                            )
+                            
+                            # Send to Telegram
+                            if config.ENABLE_TELEGRAM and should_notify and not in_warmup:
+                                message = telegram_bot.format_signal_message(signal)
+                                await telegram_bot.send_telegram_message(message)
+                            
+                            # Console output
+                            label_emoji = {
+                                "ULTRA_BUY": "🚀",
+                                "STRONG_BUY": "📈",
+                                "WATCH": "👀",
+                            }.get(label, "ℹ️")
+                            logger.info(f"{label_emoji} {label}: {symbol}")
+                            core_score = signal.get('score_core', signal.get('total_score', 0))
+                            htf_bonus = signal.get('htf_bonus', 0)
+                            total_score = signal.get('score_total', signal.get('total_score', 0))
+                            logger.info(f"   Price: ${signal.get('price', 0):.6f}")
+                            logger.info(
+                                "   Scores: T=%s O=%s V=%s PA=%s | Core=%s HTF+%s Total=%s",
+                                signal.get('trend_score'),
+                                signal.get('osc_score'),
+                                signal.get('vol_score'),
+                                signal.get('pa_score'),
+                                core_score,
+                                htf_bonus,
+                                total_score,
+                            )
+                            risk_tag = signal.get('risk_tag')
+                            if risk_tag and risk_tag != "NORMAL":
+                                logger.info("   Risk Tag: %s", risk_tag)
+                            if blocked_reason:
+                                logger.info("   Block Reason: %s", blocked_reason)
+                            filter_notes = signal.get('filter_notes')
+                            if filter_notes:
+                                for note in filter_notes:
+                                    logger.info("   %s", note)
+
+                            if should_notify:
+                                signal_monitor.register_signal(signal)
+                            
+                        except Exception as e:
+                            logger.error(f"Error processing signal: {e}")
+                else:
+                    logger.info("No signals generated in this scan")
+                
+                # Scan statistics
+                scan_duration = (datetime.now() - scan_start).seconds
+                logger.info(f"Scan completed in {scan_duration} seconds")
+                logger.info(f"Total signals generated: {total_signals}")
+                
+                # Clean up old cooldowns
+                current_time = datetime.now()
+                expired_symbols = [
+                    symbol for symbol, signal_time in last_signal_times.items()
+                    if current_time - signal_time > timedelta(minutes=config.COOLDOWN_MINUTES * 2)
+                ]
+                for symbol in expired_symbols:
+                    del last_signal_times[symbol]
+                
+                # Wait before next scan
+                logger.info(f"⏰ Waiting 60 seconds before next scan...")
+                await asyncio.sleep(60)
+                
+            except KeyboardInterrupt:
+                logger.info("Received shutdown signal...")
+                break
+            except Exception as e:
+                logger.error(f"Main loop error: {e}", exc_info=True)
+                logger.info("Recovering in 30 seconds...")
+                await asyncio.sleep(30)
+    
+    logger.info("Bot shutdown complete")
+
+
+def main():
+    """Entry point with proper error handling"""
+    try:
+        # Run the async main loop
+        asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        logger.info("\n👋 Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+
+
+if __name__ == "__main__":
+    main()
+
+
+===== src\analyzer.py =====
+"""
+Symbol Analyzer Module - REAL INDICATORS & CALCULATIONS
+"""
+import logging
+from typing import Optional
+
+import numpy as np
+
+import indicators
+import price_action
+import rules
+import data_fetcher
+import config
+
+logger = logging.getLogger(__name__)
+
+
+async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
+    """
+    Analyze a single symbol with REAL indicators
+    Includes prefilters and multi-timeframe analysis
+    """
+    try:
+        symbol = symbol_data['symbol']
+        
+        # PREFILTER CHECK (24h data)
+        if symbol_data['quote_volume'] < config.MIN_24H_QUOTE_VOLUME:
+            return None
+        if symbol_data['price'] < config.MIN_PRICE_USDT:
+            return None
+        if not (config.MIN_24H_CHANGE <= symbol_data['price_change_pct'] <= config.MAX_24H_CHANGE):
+            return None
+        
+        # Fetch multi-timeframe klines
+        klines_data = await data_fetcher.fetch_multi_timeframe_klines(session, symbol)
+        
+        if not klines_data or config.MAIN_TIMEFRAME not in klines_data:
+            logger.debug(f"No kline data for {symbol}")
+            return None
+        
+        # Extract main timeframe data
+        klines = klines_data[config.MAIN_TIMEFRAME]
+        if len(klines) < 200:  # Need enough data for all indicators
+            logger.debug(f"Insufficient kline data for {symbol}: {len(klines)} bars")
+            return None
+        
+        # Extract OHLCV arrays
+        opens = [k['open'] for k in klines]
+        highs = [k['high'] for k in klines]
+        lows = [k['low'] for k in klines]
+        closes = [k['close'] for k in klines]
+        volumes = [k['volume'] for k in klines]
+        
+        # ============ CALCULATE ALL REAL INDICATORS ============
+        
+        # Moving Averages
+        ema20_values = indicators.ema(closes, config.EMA_FAST)
+        ema50_values = indicators.ema(closes, config.EMA_SLOW)
+        ema60_values = indicators.ema(closes, config.MA60_PERIOD)
+        
+        # Trend Indicators
+        adx_values, plus_di_values, minus_di_values = indicators.adx(
+            highs, lows, closes, config.ADX_PERIOD
+        )
+        macd_line, signal_line, macd_hist = indicators.macd(closes)
+        momentum_values = indicators.momentum(closes, config.MOMENTUM_PERIOD)
+        ao_values = indicators.awesome_oscillator(highs, lows)
+        
+        # Oscillators
+        rsi_values = indicators.rsi(closes, config.RSI_PERIOD)
+        stoch_k_values = indicators.stochastic_k(highs, lows, closes, config.STOCH_K_PERIOD)
+        cci_values = indicators.cci(highs, lows, closes, config.CCI_PERIOD)
+        stoch_rsi_values = indicators.stochastic_rsi(closes)
+        williams_r_values = indicators.williams_r(highs, lows, closes, config.WILLIAMS_PERIOD)
+        uo_values = indicators.ultimate_oscillator(highs, lows, closes, config.UO_PERIODS)
+        
+        # Volume Indicators
+        obv_values = indicators.obv(closes, volumes)
+        bull_power_values, bear_power_values = indicators.bull_bear_power(highs, lows, closes)
+        
+        # Get LATEST VALUES (last bar)
+        last_close = closes[-1]
+        last_ema20 = ema20_values[-1] if ema20_values[-1] is not np.nan else None
+        last_ema50 = ema50_values[-1] if ema50_values[-1] is not np.nan else None
+        last_ma60 = ema60_values[-1] if ema60_values[-1] is not np.nan else None
+        
+        # Trend indicators - latest
+        last_adx = adx_values[-1] if adx_values[-1] is not np.nan else 0
+        last_plus_di = plus_di_values[-1] if plus_di_values[-1] is not np.nan else 0
+        last_minus_di = minus_di_values[-1] if minus_di_values[-1] is not np.nan else 0
+        last_macd_hist = macd_hist[-1] if macd_hist[-1] is not np.nan else 0
+        last_momentum = momentum_values[-1] if momentum_values[-1] is not np.nan else 0
+        last_ao = ao_values[-1] if ao_values[-1] is not np.nan else 0
+        
+        # Check MACD histogram rising (last 3 bars)
+        macd_hist_rising = False
+        if len(macd_hist) >= config.MACD_HIST_RISING_BARS:
+            valid_hist = [h for h in macd_hist[-config.MACD_HIST_RISING_BARS:] if h is not np.nan]
+            if len(valid_hist) == config.MACD_HIST_RISING_BARS:
+                macd_hist_rising = all(valid_hist[i] < valid_hist[i+1] for i in range(len(valid_hist)-1))
+        
+        # Oscillators - latest
+        last_rsi = rsi_values[-1] if rsi_values[-1] is not np.nan else 50
+        last_stoch_k = stoch_k_values[-1] if stoch_k_values[-1] is not np.nan else 50
+        last_cci = cci_values[-1] if cci_values[-1] is not np.nan else 0
+        last_stoch_rsi = stoch_rsi_values[-1] if stoch_rsi_values[-1] is not np.nan else 50
+        last_williams_r = williams_r_values[-1] if williams_r_values[-1] is not np.nan else -50
+        last_uo = uo_values[-1] if uo_values[-1] is not np.nan else 50
+        last_stoch_rsi_prev = None
+        if len(stoch_rsi_values) >= 2 and stoch_rsi_values[-2] is not np.nan:
+            last_stoch_rsi_prev = stoch_rsi_values[-2]
+        last_uo_prev = None
+        if len(uo_values) >= 2 and uo_values[-2] is not np.nan:
+            last_uo_prev = uo_values[-2]
+
+        rsi_momentum_values = [np.nan] * len(rsi_values)
+        for idx in range(1, len(rsi_values)):
+            curr = rsi_values[idx]
+            prev = rsi_values[idx - 1]
+            if np.isnan(curr) or np.isnan(prev):
+                continue
+            rsi_momentum_values[idx] = curr - prev
+
+        rsi_momentum_current = None
+        if rsi_momentum_values and not np.isnan(rsi_momentum_values[-1]):
+            rsi_momentum_current = rsi_momentum_values[-1]
+
+        rsi_momentum_avg = None
+        lookback = config.RSI_MOMENTUM_LOOKBACK
+        if lookback > 0 and len(rsi_momentum_values) > lookback:
+            window = [
+                val
+                for val in rsi_momentum_values[-(lookback + 1) : -1]
+                if not np.isnan(val)
+            ]
+            if window:
+                rsi_momentum_avg = float(np.mean(window))
+        
+        # Volume indicators - latest
+        obv_change_pct = indicators.obv_change_percent(obv_values, config.OBV_TREND_LOOKBACK)
+        last_bull_power = bull_power_values[-1] if bull_power_values[-1] is not np.nan else 0
+        last_bear_power = bear_power_values[-1] if bear_power_values[-1] is not np.nan else 0
+        
+        # ============ MULTI-TIMEFRAME ANALYSIS ============
+        htf_context = {
+            "close_above_ema20": False,
+            "ema20_slope_pct": 0.0,
+            "macd_hist": 0.0,
+        }
+        ht4_price_above_ema20 = False
+        ht4_alignment = False
+        ht4_ema20_slope_pct = 0.0
+        
+        if '1h' in klines_data and len(klines_data['1h']) >= 30:
+            htf_closes = [k['close'] for k in klines_data['1h']]
+            htf_ema20 = indicators.ema(htf_closes, config.EMA_FAST)
+            if htf_ema20 and htf_ema20[-1] is not np.nan:
+                latest_ema20 = htf_ema20[-1]
+                htf_context["close_above_ema20"] = htf_closes[-1] > latest_ema20
+                slope_lookback = config.HTF_EMA_SLOPE_LOOKBACK
+                if len(htf_ema20) > slope_lookback and htf_ema20[-(slope_lookback + 1)] is not np.nan:
+                    past_ema = htf_ema20[-(slope_lookback + 1)]
+                    if past_ema:
+                        htf_context["ema20_slope_pct"] = ((latest_ema20 / past_ema) - 1) * 100
+            htf_macd_line, _, htf_macd_hist = indicators.macd(htf_closes)
+            if htf_macd_hist and htf_macd_hist[-1] is not np.nan:
+                htf_context["macd_hist"] = htf_macd_hist[-1]
+            if htf_macd_line and htf_macd_line[-1] is not np.nan:
+                htf_context["macd_line"] = htf_macd_line[-1]
+        
+        fourh_context = {}
+        if '4h' in klines_data and len(klines_data['4h']) >= 50:
+            h4_closes = [k['close'] for k in klines_data['4h']]
+            h4_ema20 = indicators.ema(h4_closes, 20)
+            h4_ema50 = indicators.ema(h4_closes, 50)
+            latest_ema20 = h4_ema20[-1]
+            latest_ema50 = h4_ema50[-1]
+            latest_close_h4 = h4_closes[-1]
+
+            if latest_ema20 is not np.nan:
+                ht4_price_above_ema20 = latest_close_h4 > latest_ema20
+
+            if latest_ema20 is not np.nan and latest_ema50 is not np.nan:
+                ht4_alignment = latest_close_h4 > latest_ema20 > latest_ema50
+
+            slope_lookback = 5
+            if len(h4_ema20) > slope_lookback and latest_ema20 is not np.nan:
+                past_ema = h4_ema20[-(slope_lookback + 1)]
+                if past_ema is not np.nan and past_ema != 0:
+                    ht4_ema20_slope_pct = ((latest_ema20 / past_ema) - 1) * 100
+
+            fourh_context = {
+                "fourh_last_close": latest_close_h4,
+                "fourh_ema20": latest_ema20 if latest_ema20 is not np.nan else None,
+                "fourh_ema50": latest_ema50 if latest_ema50 is not np.nan else None,
+                "fourh_price_above_ema20": ht4_price_above_ema20,
+                "fourh_ema_alignment_ok": ht4_alignment,
+                "fourh_ema20_slope_pct": ht4_ema20_slope_pct,
+            }
+
+        # ============ PRICE ACTION ANALYSIS ============
+        pa_signals = price_action.analyze_price_action(
+            opens, highs, lows, closes, volumes, ema20_values
+        )
+        volume_spike_factor = pa_signals.get('volume_spike_factor')
+        
+        # ============ COMPUTE BLOCK SCORES ============
+        
+        # TREND BLOCK
+        trend_block = rules.compute_trend_block(
+            price=last_close,
+            ema20=last_ema20,
+            ema50=last_ema50,
+            adx=last_adx,
+            plus_di=last_plus_di,
+            minus_di=last_minus_di,
+            macd_hist=last_macd_hist,
+            macd_hist_rising=macd_hist_rising,
+            momentum=last_momentum,
+            ao=last_ao,
+        )
+        if trend_block.details is None:
+            trend_block.details = {}
+        trend_block.details.update({
+            "fourh_price_above_ema20": ht4_price_above_ema20,
+            "fourh_ema_alignment_ok": ht4_alignment,
+            "fourh_ema20_slope_pct": ht4_ema20_slope_pct,
+        })
+        if fourh_context:
+            trend_block.details.update(fourh_context)
+        
+        # OSCILLATOR BLOCK
+        osc_block = rules.compute_osc_block(
+            rsi_val=last_rsi,
+            stoch_k=last_stoch_k,
+            cci=last_cci,
+            stoch_rsi=last_stoch_rsi,
+            williams_r=last_williams_r,
+            uo=last_uo,
+            stoch_rsi_prev=last_stoch_rsi_prev,
+            uo_prev=last_uo_prev,
+        )
+        
+        # VOLUME BLOCK
+        vol_block = rules.compute_volume_block(
+            bull_power=last_bull_power,
+            bear_power=last_bear_power,
+            volume_spike_factor=volume_spike_factor,
+            obv_change_pct=obv_change_pct,
+        )
+        
+        # PRICE ACTION BLOCK
+        pa_block = rules.compute_price_action_block(pa_signals)
+
+        # HTF BONUS BLOCK
+        htf_block = rules.compute_htf_bonus(htf_context)
+        
+        # ============ SIGNAL DECISION ============
+        meta = {
+            "price": symbol_data['price'],
+            "price_change_pct": symbol_data['price_change_pct'],
+            "quote_volume": symbol_data['quote_volume'],
+        }
+        pre_signal_context = {
+            "last_close": last_close,
+            "ma60": last_ma60,
+            "macd_1h": htf_context.get("macd_line"),
+            "macd_hist_1h": htf_context.get("macd_hist"),
+            "rsi_value": last_rsi,
+            "rsi_momentum_curr": rsi_momentum_current,
+            "rsi_momentum_avg": rsi_momentum_avg,
+        }
+
+        signal_result = rules.decide_signal_label(
+            trend_block=trend_block,
+            osc_block=osc_block,
+            vol_block=vol_block,
+            pa_block=pa_block,
+            htf_block=htf_block,
+            meta=meta,
+            rsi_value=last_rsi,
+            symbol=symbol,
+            pre_signal_context=pre_signal_context,
+        )
+        
+        # Add market data to result
+        signal_result.price = symbol_data['price']
+        signal_result.price_change_pct = symbol_data['price_change_pct']
+        signal_result.quote_volume = symbol_data['quote_volume']
+        signal_result.htf_price_above_ema = bool(htf_context.get("close_above_ema20"))
+        signal_result.fourh_price_above_ema20 = ht4_price_above_ema20
+        signal_result.fourh_alignment_ok = ht4_alignment
+        signal_result.fourh_ema20_slope_pct = ht4_ema20_slope_pct
+        signal_result.bar_close_time = klines[-1].get('close_time')
+        
+        # Return only if we have a signal
+        return signal_result.__dict__ if signal_result.label != "NO_SIGNAL" else None
+        
+    except Exception as e:
+        logger.error(f"Error analyzing {symbol_data.get('symbol', 'Unknown')}: {e}")
+        return None
+
+
+===== src\rules.py =====
+"""Rule-based scoring aligned with the revised Phase 3 spec."""
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+import config
+
+
+def _clamp(value: int, ceiling: int = 5) -> int:
+    return min(value, ceiling)
+
+
+def _ema_similarity(ema_fast: Optional[float], ema_slow: Optional[float]) -> bool:
+    if ema_fast in (None, 0) or ema_slow in (None, 0):
+        return False
+    diff_ratio = abs(ema_fast - ema_slow) / max(abs(ema_slow), 1e-8)
+    return diff_ratio <= config.EMA_SIMILARITY_TOLERANCE
+
+@dataclass
+class BlockScore:
+    score: int
+    reasons: List[str]
+    details: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class SignalResult:
+    symbol: str
+    trend_score: int
+    osc_score: int
+    vol_score: int
+    pa_score: int
+    htf_bonus: int
+    score_core: int
+    score_total: int
+    label: str
+    reasons: List[str]
+    rsi: float
+    price: float = 0.0
+    price_change_pct: float = 0.0
+    quote_volume: float = 0.0
+    risk_tag: Optional[str] = None
+    trend_details: Optional[Dict[str, Any]] = None
+    osc_details: Optional[Dict[str, Any]] = None
+    vol_details: Optional[Dict[str, Any]] = None
+    pa_details: Optional[Dict[str, Any]] = None
+    htf_details: Optional[Dict[str, Any]] = None
+    mtf_trend_confirmed: bool = False
+    htf_price_above_ema: bool = False
+    fourh_price_above_ema20: bool = False
+    fourh_alignment_ok: bool = False
+    fourh_ema20_slope_pct: float = 0.0
+    bar_close_time: Optional[int] = None
+    filter_notes: Optional[List[str]] = None
+    total_score: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.total_score = self.score_total
+
+
+def compute_trend_block(
+    price: float,
+    ema20: Optional[float],
+    ema50: Optional[float],
+    adx: float,
+    plus_di: float,
+    minus_di: float,
+    macd_hist: float,
+    macd_hist_rising: bool,
+    momentum: float,
+    ao: float,
+) -> BlockScore:
+    """Trend block implements the 0–5 rubric from the revised spec."""
+    adx_pts = 0
+    if adx >= 25:
+        adx_pts = 2
+    elif adx >= 20:
+        adx_pts = 1
+
+    di_pts = 1 if plus_di > minus_di else 0
+
+    price_above_ema20 = ema20 is not None and price > ema20
+    ema_stack = ema20 is not None and ema50 is not None and price > ema20 > ema50
+    ema_close = price_above_ema20 and _ema_similarity(ema20, ema50)
+    ema_pts = 2 if ema_stack else (1 if ema_close else 0)
+
+    macd_pts = 1 if (macd_hist > 0 and macd_hist_rising) else 0
+    ao_mom_pts = 1 if (momentum > 0 and ao > 0) else 0
+
+    raw_score = adx_pts + di_pts + ema_pts + macd_pts + ao_mom_pts
+    score = _clamp(raw_score)
+
+    reasons: List[str] = []
+    if adx_pts:
+        strength = "strong" if adx_pts == 2 else "moderate"
+        reasons.append(f"Trend: ADX {adx:.1f} {strength} with DI+>DI-")
+    elif di_pts:
+        reasons.append("Trend: DI+ leading DI-")
+
+    if ema_stack:
+        reasons.append("Trend: Price>EMA20>EMA50 stack intact")
+    elif ema_close:
+        reasons.append("Trend: Price above EMA20 while EMA20≈EMA50")
+
+    if macd_pts:
+        reasons.append("Trend: MACD histogram positive & rising")
+    if ao_mom_pts:
+        reasons.append("Trend: Momentum and AO both positive")
+
+    details = {
+        "adx": adx,
+        "plus_di": plus_di,
+        "minus_di": minus_di,
+        "ema20": ema20,
+        "ema50": ema50,
+        "price_above_ema20": price_above_ema20,
+        "ema_stack_ok": ema_stack,
+        "macd_hist": macd_hist,
+        "macd_hist_rising": macd_hist_rising,
+        "momentum": momentum,
+        "ao": ao,
+    }
+    return BlockScore(score=int(score), reasons=reasons[:4], details=details)
+
+
+def compute_osc_block(
+    rsi_val: float,
+    stoch_k: float,
+    cci: float,
+    stoch_rsi: float,
+    williams_r: float,
+    uo: float,
+    stoch_rsi_prev: Optional[float] = None,
+    uo_prev: Optional[float] = None,
+) -> BlockScore:
+    """Oscillator block using the 0–5 rubric."""
+    rsi_pts = 0
+    if config.RSI_STRONG_MIN <= rsi_val <= config.RSI_STRONG_MAX:
+        rsi_pts = 2
+    elif (
+        config.RSI_BUFFER_MIN <= rsi_val < config.RSI_STRONG_MIN
+        or config.RSI_STRONG_MAX < rsi_val <= config.RSI_BUFFER_MAX
+    ):
+        rsi_pts = 1
+
+    stoch_pts = 1 if stoch_k > config.STOCH_K_MIDLINE else 0
+    cci_pts = 1 if cci > config.CCI_STRONG_THRESHOLD else 0
+
+    stoch_rsi_bull = (
+        stoch_rsi > config.STOCH_RSI_BULL_LEVEL
+        and stoch_rsi_prev is not None
+        and stoch_rsi > stoch_rsi_prev
+    )
+    uo_rising = uo_prev is not None and (uo - uo_prev) >= config.UO_RISING_MIN_DELTA
+    combo_bull = stoch_rsi_bull or (williams_r > config.WILLIAMS_BULLISH and uo_rising)
+    other_pts = 1 if combo_bull else 0
+
+    score = _clamp(rsi_pts + stoch_pts + cci_pts + other_pts)
+
+    reasons: List[str] = []
+    if rsi_pts == 2:
+        reasons.append(f"Osc: RSI {rsi_val:.1f} in 50-65 sweet spot")
+    elif rsi_pts == 1:
+        reasons.append(f"Osc: RSI {rsi_val:.1f} holding mid band")
+
+    if stoch_pts:
+        reasons.append(f"Osc: StochK {stoch_k:.1f} > 50")
+    if cci_pts:
+        reasons.append(f"Osc: CCI {cci:.0f} above {config.CCI_STRONG_THRESHOLD}")
+    if other_pts:
+        if stoch_rsi_bull:
+            reasons.append("Osc: StochRSI above 50 and rising")
+        else:
+            reasons.append("Osc: Williams%R + UO rising confirmation")
+
+    details = {
+        "rsi": rsi_val,
+        "stoch_k": stoch_k,
+        "cci": cci,
+        "stoch_rsi": stoch_rsi,
+        "stoch_rsi_prev": stoch_rsi_prev,
+        "williams_r": williams_r,
+        "uo": uo,
+        "uo_prev": uo_prev,
+    }
+    return BlockScore(score=int(score), reasons=reasons[:4], details=details)
+
+
+def compute_volume_block(
+    bull_power: float,
+    bear_power: float,
+    volume_spike_factor: Optional[float],
+    obv_change_pct: float,
+) -> BlockScore:
+    """Volume & power block: spike + OBV + bull bear power."""
+    spike_pts = 0
+    if volume_spike_factor is not None:
+        if volume_spike_factor >= config.VOLUME_SPIKE_STRONG:
+            spike_pts = 2
+        elif volume_spike_factor >= config.VOLUME_SPIKE_MEDIUM:
+            spike_pts = 1
+
+    obv_pts = 0
+    if obv_change_pct >= config.OBV_UPTREND_MIN_PCT:
+        obv_pts = 2
+    elif obv_change_pct >= config.OBV_SIDEWAYS_MIN_PCT:
+        obv_pts = 1
+
+    power_pts = 1 if (bull_power > 0 and bear_power < 0) else 0
+
+    score = _clamp(spike_pts + obv_pts + power_pts)
+
+    reasons: List[str] = []
+    if spike_pts == 2:
+        reasons.append(f"Vol: Volume spike {volume_spike_factor:.1f}x avg (strong)")
+    elif spike_pts == 1:
+        reasons.append(f"Vol: Volume spike {volume_spike_factor:.1f}x avg")
+
+    if obv_pts == 2:
+        reasons.append(
+            f"Vol: OBV up {obv_change_pct:.1f}%/{config.OBV_TREND_LOOKBACK} bars"
+        )
+    elif obv_pts == 1:
+        reasons.append("Vol: OBV tilting upward")
+
+    if power_pts:
+        reasons.append(
+            f"Vol: Bull power {bull_power:.4f} vs Bear {bear_power:.4f} (bull bias)"
+        )
+
+    details = {
+        "bull_power": bull_power,
+        "bear_power": bear_power,
+        "volume_spike_factor": volume_spike_factor,
+        "obv_change_pct": obv_change_pct,
+    }
+    return BlockScore(score=int(score), reasons=reasons[:4], details=details)
+
+
+def compute_price_action_block(pa_signals: dict) -> BlockScore:
+    """Price-action scoring with collapse gate and EMA breakout tiers."""
+    details = dict(pa_signals.get("details") or {})
+    collapse_ok = pa_signals.get("collapse_ok", True)
+    if not collapse_ok:
+        drop_pct = details.get("max_drop_pct")
+        if drop_pct is not None:
+            reasons = [
+                f"PA: Collapse {drop_pct:.1f}% in last {config.COLLAPSE_LOOKBACK_BARS} candles"
+            ]
+        else:
+            reasons = ["PA: Recent collapse blocks score"]
+        return BlockScore(score=0, reasons=reasons, details=details)
+
+    ema_pts = 0
+    if pa_signals.get("ema_breakout"):
+        ema_pts += 1
+    if pa_signals.get("ema_retest"):
+        ema_pts += 1
+
+    green_pts = 0
+    if pa_signals.get("very_strong_green"):
+        green_pts = 2
+    elif pa_signals.get("strong_green"):
+        green_pts = 1
+
+    wick_pts = 1 if pa_signals.get("long_lower_wick") else 0
+
+    score = _clamp(ema_pts + green_pts + wick_pts)
+
+    reasons: List[str] = []
+    if pa_signals.get("ema_breakout"):
+        reasons.append("PA: EMA20 breakout confirmed")
+    if pa_signals.get("ema_retest"):
+        reasons.append("PA: EMA20 retest + bounce")
+    if pa_signals.get("very_strong_green"):
+        reasons.append("PA: Very strong green impulse candle")
+    elif pa_signals.get("strong_green"):
+        reasons.append("PA: Strong green candle backing move")
+    if pa_signals.get("long_lower_wick"):
+        reasons.append("PA: Long lower wick support sweep")
+
+    return BlockScore(score=int(score), reasons=reasons[:4], details=details)
+
+
+def compute_htf_bonus(htf_context: Dict[str, Any]) -> BlockScore:
+    """1h higher-timeframe bonus: +1 each for close>EMA20, positive slope, MACD >= 0."""
+    close_above_ema = bool(htf_context.get("close_above_ema20"))
+    ema_slope_pct = float(htf_context.get("ema20_slope_pct", 0.0) or 0.0)
+    macd_hist = float(htf_context.get("macd_hist", 0.0) or 0.0)
+
+    bonus = 0
+    reasons: List[str] = []
+    if close_above_ema:
+        bonus += 1
+        reasons.append("HTF: 1h close above EMA20")
+    if ema_slope_pct > config.HTF_SLOPE_MIN_PCT:
+        bonus += 1
+        reasons.append(f"HTF: EMA20 slope {ema_slope_pct:+.2f}% rising")
+    if macd_hist >= 0:
+        bonus += 1
+        reasons.append("HTF: 1h MACD histogram >= 0")
+
+    details = {
+        "close_above_ema20": close_above_ema,
+        "ema20_slope_pct": ema_slope_pct,
+        "macd_hist": macd_hist,
+    }
+    return BlockScore(score=_clamp(bonus, ceiling=3), reasons=reasons[:3], details=details)
+
+
+def detect_risk(
+    meta: Optional[Dict[str, Any]],
+    trend_score: int,
+    vol_score: int,
+    osc_score: int,
+    pa_score: int,
+) -> Optional[str]:
+    meta = meta or {}
+    change = meta.get("price_change_pct")
+    if change is not None and change > config.RISK_LATE_PUMP_CHANGE:
+        return "LATE_PUMP"
+    if vol_score >= config.RISK_VOL_STRONG and trend_score <= config.RISK_TREND_WEAK:
+        return "PUMP_DUMP_RISK"
+    return "NORMAL"
+
+
+def decide_signal_label(
+    trend_block: BlockScore,
+    osc_block: BlockScore,
+    vol_block: BlockScore,
+    pa_block: BlockScore,
+    htf_block: Optional[BlockScore],
+    meta: Optional[Dict[str, Any]],
+    *,
+    rsi_value: float,
+    symbol: str,
+    pre_signal_context: Optional[Dict[str, Any]] = None,
+) -> SignalResult:
+    """Aggregate block scores and label outcome per revised thresholds."""
+    trend_component = trend_block.score if config.ENABLE_TREND_BLOCK else 0
+    osc_component = osc_block.score if config.ENABLE_OSC_BLOCK else 0
+    vol_component = vol_block.score if config.ENABLE_VOLUME_BLOCK else 0
+    pa_component = pa_block.score if config.ENABLE_PRICE_ACTION_BLOCK else 0
+    htf_bonus = htf_block.score if htf_block else 0
+
+    score_core = trend_component + osc_component + vol_component + pa_component
+    score_total = score_core + htf_bonus
+
+    reasons: List[str] = []
+    if config.ENABLE_TREND_BLOCK:
+        reasons.extend(trend_block.reasons)
+    if config.ENABLE_OSC_BLOCK:
+        reasons.extend(osc_block.reasons)
+    if config.ENABLE_VOLUME_BLOCK:
+        reasons.extend(vol_block.reasons)
+    if config.ENABLE_PRICE_ACTION_BLOCK:
+        reasons.extend(pa_block.reasons)
+    if htf_block:
+        reasons.extend(htf_block.reasons)
+
+    label = "NO_SIGNAL"
+    if score_core < config.CORE_SCORE_WATCH_MIN:
+        label = "NO_SIGNAL"
+    elif score_core < config.CORE_SCORE_STRONG_MIN:
+        label = "WATCH"
+    elif (
+        score_core < config.CORE_SCORE_ULTRA_MIN
+        and trend_component >= config.TREND_MIN_FOR_STRONG
+        and vol_component >= config.VOL_MIN_FOR_STRONG
+    ):
+        label = "STRONG_BUY"
+    elif (
+        score_core >= config.CORE_SCORE_ULTRA_MIN
+        and trend_component >= config.TREND_MIN_FOR_ULTRA
+        and osc_component >= config.OSC_MIN_FOR_ULTRA
+        and vol_component >= config.VOL_MIN_FOR_ULTRA
+        and htf_bonus >= config.HTF_MIN_FOR_ULTRA
+    ):
+        label = "ULTRA_BUY"
+
+    filter_notes: List[str] = []
+    label, filter_notes = _apply_pre_signal_filters(
+        label=label,
+        score_core=score_core,
+        rsi_value=rsi_value,
+        context=pre_signal_context or {},
+    )
+
+    risk_tag = detect_risk(meta, trend_component, vol_component, osc_component, pa_component)
+
+    return SignalResult(
+        symbol=symbol,
+        trend_score=trend_component,
+        osc_score=osc_component,
+        vol_score=vol_component,
+        pa_score=pa_component,
+        htf_bonus=htf_bonus,
+        score_core=score_core,
+        score_total=score_total,
+        label=label,
+        reasons=reasons[:5],
+        rsi=rsi_value,
+        price=meta.get("price") if meta else 0.0,
+        price_change_pct=meta.get("price_change_pct") if meta else 0.0,
+        quote_volume=meta.get("quote_volume") if meta else 0.0,
+        risk_tag=risk_tag,
+        trend_details=trend_block.details,
+        osc_details=osc_block.details,
+        vol_details=vol_block.details,
+        pa_details=pa_block.details,
+        htf_details=htf_block.details if htf_block else None,
+        filter_notes=filter_notes or None,
+    )
+
+
+def _apply_pre_signal_filters(
+    *,
+    label: str,
+    score_core: int,
+    rsi_value: float,
+    context: Dict[str, Any],
+) -> tuple[str, List[str]]:
+    """Downgrade STRONG/ULTRA labels when guardrails fail."""
+    if label not in {"STRONG_BUY", "ULTRA_BUY"}:
+        return label, []
+
+    notes: List[str] = []
+
+    close_price = context.get("last_close")
+    ma60 = context.get("ma60")
+    if close_price is not None and ma60 is not None and close_price < ma60:
+        notes.append("Filter: Price below MA60 on 15m")
+
+    macd_hist_1h = context.get("macd_hist_1h")
+    if macd_hist_1h is not None and macd_hist_1h < config.MACD_1H_HIST_MIN_VALUE:
+        notes.append("Filter: 1h MACD histogram below zero")
+
+    if rsi_value is not None and rsi_value <= config.RSI_PRE_FILTER_THRESHOLD:
+        notes.append(
+            f"Filter: RSI {rsi_value:.1f} ≤ {config.RSI_PRE_FILTER_THRESHOLD:.0f}"
+        )
+
+    rsi_momentum_curr = context.get("rsi_momentum_curr")
+    rsi_momentum_avg = context.get("rsi_momentum_avg")
+    if (
+        rsi_momentum_curr is not None
+        and rsi_momentum_avg is not None
+        and rsi_momentum_curr <= rsi_momentum_avg * config.RSI_MOMENTUM_MIN_MULTIPLIER
+    ):
+        notes.append("Filter: RSI momentum not exceeding 10-bar avg")
+
+    if not notes:
+        return label, []
+
+    downgraded = "WATCH" if score_core >= config.CORE_SCORE_WATCH_MIN else "NO_SIGNAL"
+    return downgraded, notes
+
+
+===== src\config.py =====
+"""
+Configuration - Complete parameters for production
+"""
+
+# Binance API
+BINANCE_BASE_URL = "https://api.binance.com"
+SYMBOL_FILTER_SUFFIX = "USDT"
+
+# Symbols to exclude entirely (stablecoins, etc.)
+STABLE_SYMBOLS = {
+    "USDCUSDT",
+    "BUSDUSDT",
+    "TUSDUSDT",
+    "DAIUSDT",
+    "USDPUSDT",
+    "GUSDUSDT",
+    "LUSDUSDT",
+    "USDEUSDT",
+    "USD1USDT",
+    "XUSDUSDT",
+    "FDUSDUSDT",
+    "USDSUSDT",      # bazı borsalarda stable
+    "EURSUSDT",      # euro stable (isteğe bağlı)
+    "BFUSDUSDT",
+}
+
+# Timeframes
+TIMEFRAMES = ["15m", "1h", "4h"]
+MAIN_TIMEFRAME = "15m"
+MAIN_TIMEFRAME_MINUTES = 15
+
+# === PREFILTERS ===
+MIN_24H_QUOTE_VOLUME = 10_000_000  # $10M minimum volume per revised spec
+MIN_PRICE_USDT = 0.04  # Filter illiquid penny assets
+MIN_24H_CHANGE = -10.0  # Reject symbols dumping more than 10%
+MAX_24H_CHANGE = 20.0  # Reject symbols pumping beyond 20%
+
+# Signal Settings
+COOLDOWN_MINUTES = 60
+MAX_SYMBOLS_PER_SCAN = 50  # Limit to top 50 by volume
+
+# Pre-signal gating filters
+MA60_PERIOD = 60
+RSI_PRE_FILTER_THRESHOLD = 50.0
+RSI_MOMENTUM_LOOKBACK = 10
+RSI_MOMENTUM_MIN_MULTIPLIER = 1.02
+MACD_1H_MIN_VALUE = 0.0
+MACD_1H_HIST_MIN_VALUE = 0.0
+
+# Post-signal validation
+FOLLOW_THROUGH_TARGET_MULTIPLIER = 1.015  # Require +1.5% within validation window
+FOLLOW_THROUGH_BARS = 12
+BLOCK_DURATION_MINUTES = 180
+
+# Legacy aliases (Phase 2 compatibility)
+POST_SIGNAL_TARGET_PCT = (FOLLOW_THROUGH_TARGET_MULTIPLIER - 1.0) * 100
+POST_SIGNAL_MONITOR_BARS = FOLLOW_THROUGH_BARS
+POST_SIGNAL_BLOCK_MINUTES = BLOCK_DURATION_MINUTES
+
+# Telegram
+ENABLE_TELEGRAM = True  # Set True and add credentials
+TELEGRAM_BOT_TOKEN = "7611453017:AAFAz9jBsUQ-N6RUdQ8pnct0gIzV2UeEmIM"
+TELEGRAM_CHAT_ID = "5883922751"
+
+# API Settings
+REQUEST_TIMEOUT = 10
+MAX_RETRIES = 3
+RETRY_BACKOFF = 2
+
+# Logging
+LOG_CSV_PATH = "signals_log.csv"
+LOG_LEVEL = "INFO"
+
+# === SIGNAL THRESHOLDS (legacy, retained for telemetry) ===
+ULTRA_BUY_SCORE = 12
+STRONG_BUY_SCORE = 8
+ULTRA_BUY_MIN_TREND = 3
+ULTRA_BUY_MIN_OSC = 2
+ULTRA_BUY_MIN_VOL_PA = 3
+ULTRA_BUY_MAX_RSI = 65
+STRONG_BUY_MIN_TREND = 2
+STRONG_BUY_MIN_OSC = 1
+STRONG_BUY_MIN_VOL_PA = 2
+
+# Block toggles (Phase 3 future-ready hooks)
+ENABLE_TREND_BLOCK = True
+ENABLE_OSC_BLOCK = True
+ENABLE_VOLUME_BLOCK = True
+ENABLE_PRICE_ACTION_BLOCK = True
+
+# === INDICATOR PARAMETERS ===
+# Moving Averages
+EMA_FAST = 20
+EMA_SLOW = 50
+
+# Trend
+ADX_PERIOD = 14
+ADX_STRONG_TREND = 20.0
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+MACD_HIST_RISING_BARS = 3
+MOMENTUM_PERIOD = 10
+
+# Oscillators
+RSI_PERIOD = 14
+RSI_HEALTHY_MIN = 45
+RSI_HEALTHY_MAX = 65
+STOCH_K_PERIOD = 14
+STOCH_D_PERIOD = 3
+STOCH_OVERSOLD = 20
+STOCH_OVERBOUGHT = 80
+CCI_PERIOD = 20
+WILLIAMS_PERIOD = 14
+WILLIAMS_BULLISH = -60
+UO_PERIODS = (7, 14, 28)
+UO_BULLISH = 50
+
+# Volume
+OBV_TREND_LOOKBACK = 10
+VOLUME_SPIKE_MULTIPLIER = 1.5
+VOLUME_LOOKBACK = 20
+
+# Price Action
+MIN_BODY_PCT = 1.0  # 1% minimum candle body
+COLLAPSE_MAX_DROP_PCT = 20.0
+COLLAPSE_LOOKBACK_BARS = 96
+MIN_BAR_VOLUME_USDT = 10000
+EMA_BREAK_LOOKBACK = 10
+EMA_RETEST_LOOKBACK = 10
+EMA_NEAR_TOLERANCE = 0.01  # 1% proximity check for EMA20 retest detection
+EMA_SIMILARITY_TOLERANCE = 0.01  # EMA20 considered ~ EMA50 when within 1%
+STRONG_GREEN_BODY_MULTIPLIER = 1.5  # strong vs average body size
+STRONG_GREEN_LOOKBACK = 20
+LONG_WICK_MIN_RATIO = 0.40
+
+# Volume scoring helpers
+VOLUME_SPIKE_STRONG = 1.5
+VOLUME_SPIKE_MEDIUM = 1.2
+OBV_UPTREND_MIN_PCT = 2.0
+OBV_SIDEWAYS_MIN_PCT = 0.5
+BULL_POWER_DOMINANCE = 0.0  # Bull power must be > 0 and bear < 0 for bonus
+
+# Higher timeframe confirmation
+HTF_EMA_SLOPE_LOOKBACK = 5
+HTF_SLOPE_MIN_PCT = 0.0  # Slope must be non-negative for bonus
+
+# Risk tagging thresholds
+RISK_LATE_PUMP_CHANGE = 15.0
+RISK_VOL_STRONG = 3
+RISK_TREND_WEAK = 2
+
+# Core score thresholds (Phase 3 revised spec)
+CORE_SCORE_WATCH_MIN = 8
+CORE_SCORE_STRONG_MIN = 11
+CORE_SCORE_ULTRA_MIN = 14
+TREND_MIN_FOR_STRONG = 3
+VOL_MIN_FOR_STRONG = 2
+TREND_MIN_FOR_ULTRA = 4
+OSC_MIN_FOR_ULTRA = 3
+VOL_MIN_FOR_ULTRA = 3
+HTF_MIN_FOR_ULTRA = 2
+
+# Oscillator / momentum guardrails
+RSI_STRONG_MIN = 50
+RSI_STRONG_MAX = 65
+RSI_BUFFER_MIN = 45
+RSI_BUFFER_MAX = 70
+STOCH_K_MIDLINE = 50
+CCI_STRONG_THRESHOLD = 100
+STOCH_RSI_BULL_LEVEL = 50
+UO_RISING_MIN_DELTA = 0.5
+
+# Backtest
+BACKTEST_TP_PERCENTS = [2.0, 3.0, 5.0, 10.0]
+BACKTEST_SL_PERCENTS = [1.0, 2.0, 3.0]
+BACKTEST_LOOKAHEAD_BARS = 96
+
+
+===== src\data_fetcher.py =====
+"""Binance data fetching helpers for Phase 1 (rule-based bot).
+
+These helpers share the aiohttp session that main/analyzer already manage. They
+respect the request/retry settings in config and only expose the endpoints that
+Phase 1 requires (24h tickers + multi-timeframe klines).
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Dict, List
+
+import aiohttp
+
+import config
+
+logger = logging.getLogger(__name__)
+
+_TICKER_ENDPOINT = f"{config.BINANCE_BASE_URL}/api/v3/ticker/24hr"
+_KLINES_ENDPOINT = f"{config.BINANCE_BASE_URL}/api/v3/klines"
+
+
+async def fetch_24h_tickers(session: aiohttp.ClientSession) -> List[dict]:
+    """Return the raw 24h ticker payload for all USDT pairs."""
+    params = {"type": "FULL"}
+    return await _request_with_retry(session, "GET", _TICKER_ENDPOINT, params=params)
+
+
+def parse_ticker_data(raw_ticker: dict) -> Dict[str, float] | None:
+    """Return normalized ticker data or None when the symbol is out of scope."""
+    symbol = raw_ticker.get("symbol", "")
+    if not symbol.endswith(config.SYMBOL_FILTER_SUFFIX):
+        return None  # Non-USDT pairs are silently skipped upstream.
+
+    price = float(raw_ticker.get("lastPrice", 0.0))
+    quote_volume = float(raw_ticker.get("quoteVolume", 0.0))
+    price_change_pct = float(raw_ticker.get("priceChangePercent", 0.0))
+
+    return {
+        "symbol": symbol,
+        "price": price,
+        "quote_volume": quote_volume,
+        "price_change_pct": price_change_pct,
+    }
+
+
+async def fetch_multi_timeframe_klines(
+    session: aiohttp.ClientSession, symbol: str
+) -> Dict[str, List[dict]]:
+    """Fetch OHLCV data for all configured timeframes for the given symbol."""
+    results: Dict[str, List[dict]] = {}
+    usdt_symbol = symbol if symbol.endswith(config.SYMBOL_FILTER_SUFFIX) else f"{symbol}{config.SYMBOL_FILTER_SUFFIX}"
+
+    for interval in config.TIMEFRAMES:
+        params = {
+            "symbol": usdt_symbol,
+            "interval": interval,
+            "limit": 500,
+        }
+        klines = await _request_with_retry(session, "GET", _KLINES_ENDPOINT, params=params)
+        parsed = [
+            {
+                "open": float(item[1]),
+                "high": float(item[2]),
+                "low": float(item[3]),
+                "close": float(item[4]),
+                "volume": float(item[5]),
+                "close_time": int(item[6]),
+            }
+            for item in klines
+        ]
+        results[interval] = parsed
+
+    return results
+
+
+async def _request_with_retry(
+    session: aiohttp.ClientSession,
+    method: str,
+    url: str,
+    params: Dict[str, str] | None = None,
+) -> List[dict]:
+    """Perform HTTP request with the retry/backoff policy from config."""
+    retries = max(1, config.MAX_RETRIES)
+    last_exc: Exception | None = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            async with session.request(method, url, params=params, timeout=config.REQUEST_TIMEOUT) as resp:
+                resp.raise_for_status()
+                return await resp.json()
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            logger.warning("Binance request failed (attempt %s/%s): %s", attempt, retries, exc)
+            if attempt < retries:
+                await asyncio.sleep(config.RETRY_BACKOFF)
+
+    raise RuntimeError(f"Failed to fetch {url}: {last_exc}")
+
+
+===== src\indicators.py =====
+"""Technical indicator helpers used by analyzer.py (Phase 1).
+
+All functions return full-length lists and use numpy NaNs when insufficient data
+exists. Wherever analyzer.py does not pass an explicit period (e.g. MACD,
+Stochastic RSI), this module pulls the values from config so that all tuning
+remains centralized there. Implementations are deterministic and match standard
+rule-based formulas aligned with the client docs.
+"""
+from __future__ import annotations
+
+from typing import List, Sequence, Tuple
+
+import numpy as np
+
+import config
+
+NAN = np.nan
+
+
+def ema(values: Sequence[float], period: int) -> List[float]:
+    values = _to_float_array(values)
+    length = len(values)
+    result = [NAN] * length
+    if period <= 0 or length == 0:
+        return result
+
+    start = _find_seed_window(values, period)
+    if start is None:
+        return result
+
+    seed = float(np.mean(values[start : start + period]))
+    idx = start + period - 1
+    result[idx] = seed
+    multiplier = 2 / (period + 1)
+    ema_val = seed
+
+    for i in range(idx + 1, length):
+        val = values[i]
+        if np.isnan(val):
+            result[i] = NAN
+            continue
+        ema_val = (val - ema_val) * multiplier + ema_val
+        result[i] = ema_val
+
+    return result
+
+
+def _sma(values: np.ndarray, period: int) -> np.ndarray:
+    length = len(values)
+    result = np.full(length, NAN)
+    if period <= 0 or length < period:
+        return result
+    cumsum = np.cumsum(values, dtype=float)
+    cumsum[period:] = cumsum[period:] - cumsum[:-period]
+    result[period - 1 :] = cumsum[period - 1 :] / period
+    return result
+
+
+def adx(
+    highs: Sequence[float],
+    lows: Sequence[float],
+    closes: Sequence[float],
+    period: int,
+) -> Tuple[List[float], List[float], List[float]]:
+    h = _to_float_array(highs)
+    l = _to_float_array(lows)
+    c = _to_float_array(closes)
+    length = len(c)
+
+    adx_vals = [NAN] * length
+    plus_di = [NAN] * length
+    minus_di = [NAN] * length
+
+    if period <= 0 or length < period + 1:
+        return adx_vals, plus_di, minus_di
+
+    tr_list: List[float] = []
+    plus_dm_list: List[float] = []
+    minus_dm_list: List[float] = []
+
+    for i in range(1, length):
+        tr = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
+        tr_list.append(tr)
+
+        up_move = h[i] - h[i - 1]
+        down_move = l[i - 1] - l[i]
+        plus_dm_list.append(up_move if (up_move > down_move and up_move > 0) else 0.0)
+        minus_dm_list.append(down_move if (down_move > up_move and down_move > 0) else 0.0)
+
+    atr = _wilder_smooth(tr_list, period)
+    plus_smoothed = _wilder_smooth(plus_dm_list, period)
+    minus_smoothed = _wilder_smooth(minus_dm_list, period)
+
+    for i in range(period, length):
+        atr_val = atr[i - 1]
+        if atr_val == 0 or np.isnan(atr_val):
+            continue
+        plus = 100 * plus_smoothed[i - 1] / atr_val
+        minus = 100 * minus_smoothed[i - 1] / atr_val
+        plus_di[i] = plus
+        minus_di[i] = minus
+
+    dx_values: List[float] = []
+    for i in range(period, length):
+        p = plus_di[i]
+        m = minus_di[i]
+        if np.isnan(p) or np.isnan(m) or (p + m) == 0:
+            dx_values.append(NAN)
+        else:
+            dx_values.append(100 * abs(p - m) / (p + m))
+
+    adx_series = _wilder_smooth(dx_values, period)
+    for i, val in enumerate(adx_series, start=period * 2):
+        if i < length:
+            adx_vals[i] = val
+
+    return adx_vals, plus_di, minus_di
+
+
+def _wilder_smooth(values: Sequence[float], period: int) -> List[float]:
+    arr = _to_float_array(values)
+    length = len(arr)
+    result = [NAN] * length
+    if period <= 0 or length == 0 or length < period:
+        return result
+
+    prev = float(np.sum(arr[:period]))
+    result[period - 1] = prev / period
+    for i in range(period, length):
+        prev = prev - (prev / period) + arr[i]
+        result[i] = prev / period
+    return result
+
+
+def macd(closes: Sequence[float]) -> Tuple[List[float], List[float], List[float]]:
+    fast = ema(closes, config.MACD_FAST)
+    slow = ema(closes, config.MACD_SLOW)
+    macd_line = [
+        (f - s) if _is_valid(f) and _is_valid(s) else NAN
+        for f, s in zip(fast, slow)
+    ]
+    signal_line = ema(macd_line, config.MACD_SIGNAL)
+    hist = [
+        (m - s) if _is_valid(m) and _is_valid(s) else NAN
+        for m, s in zip(macd_line, signal_line)
+    ]
+    return macd_line, signal_line, hist
+
+
+def momentum(closes: Sequence[float], period: int) -> List[float]:
+    values = _to_float_array(closes)
+    length = len(values)
+    result = [NAN] * length
+    if period <= 0 or length <= period:
+        return result
+    for i in range(period, length):
+        result[i] = values[i] - values[i - period]
+    return result
+
+
+def awesome_oscillator(highs: Sequence[float], lows: Sequence[float]) -> List[float]:
+    median = (_to_float_array(highs) + _to_float_array(lows)) / 2
+    sma5 = _sma(median, 5)
+    sma34 = _sma(median, 34)
+    return (sma5 - sma34).tolist()
+
+
+def rsi(closes: Sequence[float], period: int) -> List[float]:
+    values = _to_float_array(closes)
+    length = len(values)
+    result = [NAN] * length
+    if period <= 0 or length <= period:
+        return result
+
+    deltas = np.diff(values)
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+
+    avg_gain = _wilder_smooth(gains, period)
+    avg_loss = _wilder_smooth(losses, period)
+
+    for i in range(period, length):
+        lg = avg_gain[i - 1]
+        ll = avg_loss[i - 1]
+        if np.isnan(lg) or np.isnan(ll) or ll == 0:
+            continue
+        rs = lg / ll
+        result[i] = 100 - (100 / (1 + rs))
+    return result
+
+
+def stochastic_k(
+    highs: Sequence[float],
+    lows: Sequence[float],
+    closes: Sequence[float],
+    period: int,
+) -> List[float]:
+    h = _to_float_array(highs)
+    l = _to_float_array(lows)
+    c = _to_float_array(closes)
+    length = len(c)
+    result = [NAN] * length
+    if period <= 0 or length < period:
+        return result
+
+    for i in range(period - 1, length):
+        highest = float(np.max(h[i - period + 1 : i + 1]))
+        lowest = float(np.min(l[i - period + 1 : i + 1]))
+        denom = highest - lowest
+        if denom == 0:
+            result[i] = 50.0
+        else:
+            result[i] = 100 * (c[i] - lowest) / denom
+    return result
+
+
+def cci(
+    highs: Sequence[float],
+    lows: Sequence[float],
+    closes: Sequence[float],
+    period: int,
+) -> List[float]:
+    h = _to_float_array(highs)
+    l = _to_float_array(lows)
+    c = _to_float_array(closes)
+    tp = (h + l + c) / 3
+    sma_tp = _sma(tp, period)
+    length = len(tp)
+    result = [NAN] * length
+    if period <= 0 or length < period:
+        return result
+
+    for i in range(period - 1, length):
+        window = tp[i - period + 1 : i + 1]
+        mean_dev = np.mean(np.abs(window - sma_tp[i]))
+        denom = 0.015 * mean_dev if mean_dev != 0 else None
+        if denom:
+            result[i] = (tp[i] - sma_tp[i]) / denom
+    return result
+
+
+def stochastic_rsi(closes: Sequence[float]) -> List[float]:
+    rsi_values = rsi(closes, config.RSI_PERIOD)
+    period = config.RSI_PERIOD
+    arr = _to_float_array(rsi_values)
+    length = len(arr)
+    result = [NAN] * length
+    if length < period:
+        return result
+    for i in range(period - 1, length):
+        window = arr[i - period + 1 : i + 1]
+        valid = window[~np.isnan(window)]
+        if len(valid) == 0:
+            continue
+        min_val = np.min(valid)
+        max_val = np.max(valid)
+        denom = max_val - min_val
+        result[i] = 0 if denom == 0 else 100 * (arr[i] - min_val) / denom
+    return result
+
+
+def williams_r(
+    highs: Sequence[float],
+    lows: Sequence[float],
+    closes: Sequence[float],
+    period: int,
+) -> List[float]:
+    h = _to_float_array(highs)
+    l = _to_float_array(lows)
+    c = _to_float_array(closes)
+    length = len(c)
+    result = [NAN] * length
+    if period <= 0 or length < period:
+        return result
+    for i in range(period - 1, length):
+        highest = float(np.max(h[i - period + 1 : i + 1]))
+        lowest = float(np.min(l[i - period + 1 : i + 1]))
+        denom = highest - lowest
+        result[i] = -100 if denom == 0 else -100 * (highest - c[i]) / denom
+    return result
+
+
+def ultimate_oscillator(
+    highs: Sequence[float],
+    lows: Sequence[float],
+    closes: Sequence[float],
+    periods: Tuple[int, int, int],
+) -> List[float]:
+    short, mid, long = periods
+    h = _to_float_array(highs)
+    l = _to_float_array(lows)
+    c = _to_float_array(closes)
+    bp = c - np.minimum(l, np.roll(c, 1))
+    tr = np.maximum(h, np.roll(c, 1)) - np.minimum(l, np.roll(c, 1))
+    bp[0] = c[0] - l[0]
+    tr[0] = h[0] - l[0]
+
+    avg_short = _rolling_sum(bp, short) / _rolling_sum(tr, short)
+    avg_mid = _rolling_sum(bp, mid) / _rolling_sum(tr, mid)
+    avg_long = _rolling_sum(bp, long) / _rolling_sum(tr, long)
+
+    uo = 100 * ((4 * avg_short) + (2 * avg_mid) + avg_long) / 7
+    return uo.tolist()
+
+
+def obv(closes: Sequence[float], volumes: Sequence[float]) -> List[float]:
+    c = _to_float_array(closes)
+    v = _to_float_array(volumes)
+    length = len(c)
+    result = [0.0] * length
+    for i in range(1, length):
+        if c[i] > c[i - 1]:
+            result[i] = result[i - 1] + v[i]
+        elif c[i] < c[i - 1]:
+            result[i] = result[i - 1] - v[i]
+        else:
+            result[i] = result[i - 1]
+    return result
+
+
+def bull_bear_power(
+    highs: Sequence[float], lows: Sequence[float], closes: Sequence[float]
+) -> Tuple[List[float], List[float]]:
+    ema_vals = _to_float_array(ema(closes, config.EMA_FAST))
+    h = _to_float_array(highs)
+    l = _to_float_array(lows)
+    bull = (h - ema_vals).tolist()
+    bear = (l - ema_vals).tolist()
+    return bull, bear
+
+
+def is_obv_uptrend(obv_values: Sequence[float], lookback: int) -> bool:
+    if lookback <= 0 or len(obv_values) < lookback:
+        return False
+    start = obv_values[-lookback]
+    end = obv_values[-1]
+    return _is_valid(start) and _is_valid(end) and end > start
+
+
+def obv_change_percent(obv_values: Sequence[float], lookback: int) -> float:
+    if lookback <= 0 or len(obv_values) < lookback:
+        return 0.0
+    start = obv_values[-lookback]
+    end = obv_values[-1]
+    if not (_is_valid(start) and _is_valid(end)):
+        return 0.0
+    baseline = abs(start) if abs(start) > 1e-8 else 0.0
+    if baseline == 0:
+        return 0.0
+    return (end - start) / baseline * 100.0
+
+
+# ---------- Helper utilities ----------
+
+def _to_float_array(values: Sequence[float]) -> np.ndarray:
+    return np.asarray([float(v) if v is not None else NAN for v in values], dtype=float)
+
+
+def _find_seed_window(values: np.ndarray, period: int) -> int | None:
+    for i in range(0, len(values) - period + 1):
+        window = values[i : i + period]
+        if not np.any(np.isnan(window)):
+            return i
+    return None
+
+
+def _rolling_sum(values: np.ndarray, period: int) -> np.ndarray:
+    length = len(values)
+    result = np.full(length, NAN)
+    if period <= 0 or length < period:
+        return result
+    cumsum = np.cumsum(values, dtype=float)
+    result[period - 1 :] = cumsum[period - 1 :] - np.concatenate(
+        ([0.0], cumsum[:-period])
+    )
+    return result
+
+
+def _is_valid(value: float) -> bool:
+    return value is not None and not np.isnan(value)
+
+
+===== src\price_action.py =====
+"""Price action heuristics consumed by rules.compute_price_action_block.
+
+The logic mirrors the client docs for Phase 1 and only surfaces the boolean
+flags that rules.py expects. Any richer metrics should be added later as
+backwards-compatible extras.
+"""
+from __future__ import annotations
+
+from typing import Dict, Sequence, Tuple
+
+import numpy as np
+
+import config
+
+
+def analyze_price_action(
+    opens: Sequence[float],
+    highs: Sequence[float],
+    lows: Sequence[float],
+    closes: Sequence[float],
+    volumes: Sequence[float],
+    ema20_values: Sequence[float],
+) -> Dict[str, object]:
+    if not closes:
+        defaults = {key: False for key in _DEFAULT_KEYS}
+        defaults.update({
+            "volume_spike_factor": 0.0,
+            "details": {},
+        })
+        return defaults
+
+    open_val = float(opens[-1])
+    high_val = float(highs[-1])
+    low_val = float(lows[-1])
+    close_val = float(closes[-1])
+    volume_val = float(volumes[-1])
+
+    body = close_val - open_val
+    range_total = max(high_val - low_val, 1e-8)
+    body_pct_vs_open = abs(body) / max(abs(open_val), 1e-8) * 100
+    body_pct_of_range = abs(body) / range_total * 100 if range_total else 0
+
+    lower_wick = (min(open_val, close_val) - low_val)
+    lower_wick_ratio = lower_wick / range_total if range_total else 0
+    lower_wick_pct = lower_wick_ratio * 100
+
+    long_lower_wick = (
+        body > 0
+        and lower_wick_ratio >= config.LONG_WICK_MIN_RATIO
+        and body_pct_vs_open >= config.MIN_BODY_PCT / 2
+    )
+
+    is_green = close_val > open_val
+    strong_green, very_strong_green, avg_body = _assess_green_candle(
+        opens,
+        closes,
+        abs(body),
+        body_pct_vs_open,
+        is_green,
+    )
+
+    collapse_ok, max_drop_pct = _check_no_collapse(closes)
+    ema_break, ema_retest, ema_details = _check_ema20_break_and_retest(
+        closes, ema20_values
+    )
+    volume_spike, volume_spike_factor, avg_volume = _check_volume_spike(volumes)
+    min_volume = volume_val >= config.MIN_BAR_VOLUME_USDT
+    min_volume_multiple = (
+        volume_val / config.MIN_BAR_VOLUME_USDT if config.MIN_BAR_VOLUME_USDT > 0 else 0
+    )
+
+    pa_details = {
+        "body_pct_vs_open": body_pct_vs_open,
+        "body_pct_of_range": body_pct_of_range,
+        "lower_wick_pct": lower_wick_pct,
+        "avg_body_lookup": avg_body,
+        "max_drop_pct": max_drop_pct,
+        "ema_break_details": ema_details,
+        "volume_spike_factor": volume_spike_factor,
+        "avg_volume": avg_volume,
+        "current_volume": volume_val,
+        "min_volume_multiple": min_volume_multiple,
+    }
+
+    return {
+        "long_lower_wick": bool(long_lower_wick),
+        "strong_green": bool(strong_green),
+        "very_strong_green": bool(very_strong_green),
+        "collapse_ok": bool(collapse_ok),
+        "no_collapse": bool(collapse_ok),  # backward-compatible alias
+        "ema_breakout": bool(ema_break),
+        "ema_retest": bool(ema_retest),
+        "volume_spike": bool(volume_spike),
+        "min_volume": bool(min_volume),
+        "volume_spike_factor": float(volume_spike_factor or 0.0),
+        "details": pa_details,
+    }
+
+
+_DEFAULT_KEYS = (
+    "long_lower_wick",
+    "strong_green",
+    "very_strong_green",
+    "collapse_ok",
+    "no_collapse",
+    "ema_breakout",
+    "ema_retest",
+    "volume_spike",
+    "min_volume",
+)
+
+
+def _check_no_collapse(closes: Sequence[float]) -> Tuple[bool, float]:
+    lookback = min(config.COLLAPSE_LOOKBACK_BARS, len(closes))
+    if lookback < 2:
+        return True, 0.0
+    window = closes[-lookback:]
+    max_close = max(window)
+    min_close = min(window)
+    if max_close == 0:
+        return True, 0.0
+    drop_pct = (max_close - min_close) / max_close * 100
+    return drop_pct <= config.COLLAPSE_MAX_DROP_PCT, drop_pct
+
+
+def _assess_green_candle(
+    opens: Sequence[float],
+    closes: Sequence[float],
+    current_body_abs: float,
+    body_pct_vs_open: float,
+    is_green: bool,
+) -> Tuple[bool, bool, float]:
+    lookback = min(config.STRONG_GREEN_LOOKBACK, len(opens))
+    if lookback < 2:
+        return body_pct_vs_open >= config.MIN_BODY_PCT and is_green, False, current_body_abs
+    recent_opens = np.asarray(opens[-lookback:], dtype=float)
+    recent_closes = np.asarray(closes[-lookback:], dtype=float)
+    bodies = np.abs(recent_closes - recent_opens)
+    avg_body = float(np.mean(bodies)) if bodies.size else 0.0
+    strong_green = is_green and body_pct_vs_open >= config.MIN_BODY_PCT
+    very_strong = (
+        avg_body > 0
+        and is_green
+        and current_body_abs >= config.STRONG_GREEN_BODY_MULTIPLIER * avg_body
+    )
+    if very_strong:
+        strong_green = True
+    return strong_green, very_strong, avg_body
+
+
+def _check_ema20_break_and_retest(
+    closes: Sequence[float], ema20_values: Sequence[float]
+) -> Tuple[bool, bool, Dict[str, float]]:
+    if len(closes) < 3 or len(ema20_values) < 3:
+        return False, False, {}
+    lookback = min(config.EMA_BREAK_LOOKBACK, len(closes) - 1)
+    start_idx = len(closes) - lookback
+    breakout_idx = None
+    for idx in range(max(1, start_idx), len(closes)):
+        prev_close = closes[idx - 1]
+        curr_close = closes[idx]
+        prev_ema = ema20_values[idx - 1]
+        curr_ema = ema20_values[idx]
+        if any(np.isnan(val) for val in (prev_ema, curr_ema)):
+            continue
+        if prev_close <= prev_ema and curr_close > curr_ema:
+            breakout_idx = idx
+            break
+
+    if breakout_idx is None:
+        return False, False, {}
+
+    retest = _check_retest(closes, ema20_values, breakout_idx)
+    details = {
+        "breakout_index": breakout_idx,
+        "breakout_close": float(closes[breakout_idx]),
+        "breakout_ema": float(ema20_values[breakout_idx]),
+        "retest": retest,
+    }
+    return True, retest, details
+
+
+def _check_retest(closes: Sequence[float], ema20_values: Sequence[float], breakout_idx: int) -> bool:
+    tolerance = config.EMA_NEAR_TOLERANCE
+    max_idx = min(len(closes), breakout_idx + config.EMA_RETEST_LOOKBACK)
+    for idx in range(breakout_idx + 1, max_idx):
+        ema = ema20_values[idx]
+        close = closes[idx]
+        if ema == 0 or np.isnan(ema):
+            continue
+        if abs(close - ema) / abs(ema) <= tolerance:
+            if idx + 1 < len(closes) and closes[idx + 1] > ema20_values[idx + 1]:
+                return True
+    return False
+
+
+def _check_volume_spike(volumes: Sequence[float]) -> Tuple[bool, float, float]:
+    if len(volumes) < config.VOLUME_LOOKBACK + 1:
+        return False, 0.0, 0.0
+    recent = volumes[-(config.VOLUME_LOOKBACK + 1) : -1]
+    avg_volume = sum(recent) / len(recent)
+    if avg_volume == 0:
+        return False, 0.0, avg_volume
+    current = volumes[-1]
+    factor = current / avg_volume if avg_volume else 0.0
+    return current >= avg_volume * config.VOLUME_SPIKE_MULTIPLIER, factor, avg_volume
+
+
+===== src\telegram_bot.py =====
+"""Telegram formatting/sending helpers for Phase 1.
+
+Actual sending is gated by config.ENABLE_TELEGRAM so the bot can run without
+credentials during development.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Dict
+
+import aiohttp
+
+import config
+
+logger = logging.getLogger(__name__)
+
+_TELEGRAM_API = "https://api.telegram.org"
+_LABEL_EMOJI = {
+    "ULTRA_BUY": "🚀",
+    "STRONG_BUY": "📈",
+}
+_DEFAULT_EMOJI = "🔔"
+
+
+def format_signal_message(signal: Dict[str, object]) -> str:
+    """Return a compact multiline summary of the signal."""
+    price = signal.get("price")
+    change = signal.get("price_change_pct")
+    quote_vol = signal.get("quote_volume")
+    label = signal.get("label", "NO_SIGNAL")
+    symbol = signal.get("symbol", "UNKNOWN")
+    emoji = _LABEL_EMOJI.get(label, _DEFAULT_EMOJI)
+    trend_details = signal.get("trend_details") or {}
+    vol_details = signal.get("vol_details") or {}
+    core_score = signal.get("score_core", signal.get("total_score", 0))
+    htf_bonus = signal.get("htf_bonus", 0)
+    total_score = signal.get("score_total", signal.get("total_score", 0))
+    lines = [
+        f"{emoji} {label} - {symbol}",
+        "• Price: {price:.4f} USDT | 24h: {change:+.2f}% | Vol: {vol:,.0f} USDT".format(
+            price=float(price) if price is not None else 0.0,
+            change=float(change) if change is not None else 0.0,
+            vol=float(quote_vol) if quote_vol is not None else 0.0,
+        ),
+        "• Scores: Trend={trend}, Osc={osc}, Vol={volb}, PA={pa} | Core={core} HTF+{htf} Total={total}".format(
+            trend=signal.get("trend_score", 0),
+            osc=signal.get("osc_score", 0),
+            volb=signal.get("vol_score", 0),
+            pa=signal.get("pa_score", 0),
+            core=core_score,
+            htf=htf_bonus,
+            total=total_score,
+        ),
+    ]
+
+    htf_bits = []
+    htf_details = signal.get("htf_details") or {}
+    if htf_details.get("close_above_ema20"):
+        htf_bits.append("1h above EMA20")
+    if htf_details.get("ema20_slope_pct"):
+        htf_bits.append(f"1h EMA20 slope {float(htf_details['ema20_slope_pct']):+.1f}%")
+    if htf_details.get("macd_hist") is not None:
+        htf_bits.append(f"1h MACD {float(htf_details['macd_hist']):+.3f}")
+
+    if signal.get("fourh_alignment_ok"):
+        htf_bits.append("4h EMA stack ok")
+    elif signal.get("fourh_price_above_ema20"):
+        htf_bits.append("4h above EMA20")
+
+    slope = signal.get("fourh_ema20_slope_pct") or trend_details.get("fourh_ema20_slope_pct")
+    if slope:
+        htf_bits.append(f"4h EMA20 slope {float(slope):+.1f}%")
+
+    if htf_bits:
+        lines.append("• HTF: " + ", ".join(htf_bits[:3]))
+
+    vol_bits = []
+    if vol_details.get("volume_spike"):
+        spike_factor = vol_details.get("volume_spike_factor")
+        if spike_factor:
+            vol_bits.append(f"Spike {float(spike_factor):.1f}x avg")
+        else:
+            vol_bits.append("Volume spike vs avg")
+
+    obv_change = vol_details.get("obv_change_pct")
+    if obv_change:
+        vol_bits.append(f"OBV {float(obv_change):+.1f}%/{config.OBV_TREND_LOOKBACK} bars")
+
+    bull_power = vol_details.get("bull_power")
+    bear_power = vol_details.get("bear_power")
+    if bull_power is not None and bear_power is not None:
+        vol_bits.append(f"Bull {float(bull_power):.4f} | Bear {float(bear_power):.4f}")
+
+    if vol_bits:
+        lines.append("• Volume: " + ", ".join(vol_bits[:3]))
+
+    risk_tag = signal.get("risk_tag")
+    if risk_tag and risk_tag != "NORMAL":
+        lines.append(f"• Risk: {risk_tag}")
+
+    reasons = signal.get("reasons") or []
+    if reasons:
+        lines.append("• Top reasons:")
+        for reason in reasons[:3]:
+            lines.append(f"  - {reason}")
+    return "\n".join(lines)
+
+
+async def send_telegram_message(text: str) -> None:
+    """Send `text` to the configured Telegram chat if enabled."""
+    if not config.ENABLE_TELEGRAM:
+        return
+    if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
+        logger.warning("Telegram enabled but credentials missing; skipping send")
+        return
+
+    url = f"{_TELEGRAM_API}/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": config.TELEGRAM_CHAT_ID,
+        "text": text,
+        # Plain text avoids Markdown escaping issues that caused HTTP 400 errors.
+    }
+
+    timeout = aiohttp.ClientTimeout(total=15)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload) as resp:
+                resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Telegram send failed: %s", exc)
+
+
+===== src\logger.py =====
+"""Logging utilities used by main.py.
+
+Phase 1 requires console logging plus a CSV sink for emitted signals. The CSV
+schema is intentionally minimal and backward-compatible so later phases can add
+more columns without breaking existing analyses.
+"""
+from __future__ import annotations
+
+import csv
+import logging
+import os
+from datetime import datetime
+from typing import Dict, Optional
+
+import config
+
+_DEFAULT_COLUMNS = [
+    "timestamp",
+    "symbol",
+    "label",
+    "trend_score",
+    "osc_score",
+    "vol_score",
+    "pa_score",
+    "score_core",
+    "htf_bonus",
+    "total_score",
+    "risk_tag",
+    "rsi",
+    "price",
+    "change_24h",
+    "quote_vol_24h",
+    "reasons",
+    "htf_notes",
+    "vol_spike_factor",
+]
+
+
+def setup_logger() -> logging.Logger:
+    """Configure and return the shared application logger."""
+    logger = logging.getLogger("binance_usdt_signal_bot")
+    if logger.handlers:
+        return logger
+
+    level = getattr(logging, str(config.LOG_LEVEL).upper(), logging.INFO)
+    logger.setLevel(level)
+
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.propagate = False
+    return logger
+
+
+def log_signal_to_csv(
+    path: str,
+    signal: Dict[str, object],
+    extra_fields: Optional[Dict[str, object]] = None,
+) -> None:
+    """Append a signal row to CSV, creating the file with headers if needed."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    file_exists = os.path.isfile(path)
+
+    row = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "symbol": signal.get("symbol"),
+        "label": signal.get("label"),
+        "trend_score": signal.get("trend_score"),
+        "osc_score": signal.get("osc_score"),
+        "vol_score": signal.get("vol_score"),
+        "pa_score": signal.get("pa_score"),
+        "score_core": signal.get("score_core", signal.get("total_score")),
+        "htf_bonus": signal.get("htf_bonus"),
+        "total_score": signal.get("score_total", signal.get("total_score")),
+        "risk_tag": signal.get("risk_tag"),
+        "rsi": signal.get("rsi"),
+        "price": signal.get("price"),
+        "change_24h": signal.get("price_change_pct"),
+        "quote_vol_24h": signal.get("quote_volume"),
+        "reasons": "; ".join(signal.get("reasons", [])) if signal.get("reasons") else "",
+    }
+
+    trend_details = signal.get("trend_details") or {}
+    htf_details = signal.get("htf_details") or {}
+    vol_details = signal.get("vol_details") or {}
+
+    htf_bits = []
+    if htf_details.get("close_above_ema20"):
+        htf_bits.append("1h>EMA20")
+    if htf_details.get("ema20_slope_pct"):
+        htf_bits.append(f"1h-slope={float(htf_details['ema20_slope_pct']):+.1f}%")
+    if htf_details.get("macd_hist") is not None:
+        htf_bits.append(f"1h-MACD={float(htf_details['macd_hist']):+.3f}")
+
+    if signal.get("fourh_alignment_ok"):
+        htf_bits.append("4h-stack")
+    elif signal.get("fourh_price_above_ema20"):
+        htf_bits.append("4h>EMA20")
+
+    slope = signal.get("fourh_ema20_slope_pct") or trend_details.get("fourh_ema20_slope_pct")
+    if slope:
+        htf_bits.append(f"4h-slope={float(slope):+.1f}%")
+
+    row["htf_notes"] = " | ".join(htf_bits)
+
+    spike_factor = vol_details.get("volume_spike_factor")
+    row["vol_spike_factor"] = round(float(spike_factor), 2) if spike_factor else ""
+
+    if extra_fields:
+        row.update(extra_fields)
+
+    columns = list(dict.fromkeys(_DEFAULT_COLUMNS + list(extra_fields or {})))
+
+    with open(path, "a", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=columns)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+===== src\signal_guard.py =====
+"""Post-signal validation and blocking helpers for STRONG/ULTRA signals."""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+
+import config
+import data_fetcher
+
+logger = logging.getLogger(__name__)
+
+BAR_INTERVAL_MS = config.MAIN_TIMEFRAME_MINUTES * 60 * 1000
+
+
+@dataclass
+class ActiveSignalState:
+    """Runtime context for a STRONG/ULTRA signal awaiting validation."""
+
+    symbol: str
+    label: str
+    price: float
+    target_price: float
+    emitted_at: datetime
+    signal_close_time: int
+    deadline_close_time: int
+    first_bar_deadline: int
+    first_bar_checked: bool = False
+    first_bar_passed: bool = False
+
+
+@dataclass(frozen=True)
+class SignalFailureEvent:
+    symbol: str
+    label: str
+    reason_code: str
+    description: str
+    signal_close_time: int
+    block_expires_at: datetime
+
+
+class SignalMonitor:
+    """Tracks active signals and enforces post-signal filters (Filters 2 & 3)."""
+
+    def __init__(self) -> None:
+        self.active: Dict[str, ActiveSignalState] = {}
+        self.blocked_until: Dict[str, datetime] = {}
+        self.block_reasons: Dict[str, str] = {}
+        self._failure_events: List[SignalFailureEvent] = []
+
+    def is_symbol_blocked(self, symbol: str) -> bool:
+        now = datetime.utcnow()
+        expiry = self.blocked_until.get(symbol)
+        if expiry and now < expiry:
+            return True
+        if expiry and now >= expiry:
+            self.blocked_until.pop(symbol, None)
+            self.block_reasons.pop(symbol, None)
+        return False
+
+    def get_block_reason(self, symbol: str) -> Optional[str]:
+        if not self.is_symbol_blocked(symbol):
+            return None
+        return self.block_reasons.get(symbol)
+
+    def drain_failure_events(self) -> List[SignalFailureEvent]:
+        events = list(self._failure_events)
+        self._failure_events.clear()
+        return events
+
+    def register_signal(self, signal: dict) -> None:
+        """Start monitoring a freshly emitted STRONG/ULTRA signal."""
+        symbol = signal.get("symbol")
+        label = (signal.get("label") or "").upper()
+        if label not in {"STRONG_BUY", "ULTRA_BUY"}:
+            return
+        price = float(signal.get("price") or 0.0)
+        close_time = signal.get("bar_close_time")
+        if not symbol or not close_time or price <= 0:
+            return
+
+        target_multiplier = getattr(config, "FOLLOW_THROUGH_TARGET_MULTIPLIER", 1.015)
+        target_price = price * target_multiplier
+        monitor_bars = getattr(config, "FOLLOW_THROUGH_BARS", config.POST_SIGNAL_MONITOR_BARS)
+        deadline_close_time = close_time + (monitor_bars * BAR_INTERVAL_MS)
+        first_bar_deadline = close_time + BAR_INTERVAL_MS
+
+        self.active[symbol] = ActiveSignalState(
+            symbol=symbol,
+            label=label,
+            price=price,
+            target_price=target_price,
+            emitted_at=datetime.utcnow(),
+            signal_close_time=int(close_time),
+            deadline_close_time=int(deadline_close_time),
+            first_bar_deadline=int(first_bar_deadline),
+        )
+        logger.info(
+            "Post-signal monitor registered for %s (target %.4f by %s)",
+            symbol,
+            target_price,
+            datetime.fromtimestamp(deadline_close_time / 1000.0),
+        )
+
+    async def evaluate_active_signals(self, session) -> None:
+        """Poll Binance and update each active signal's validation status."""
+        if not self.active:
+            return
+
+        for symbol in list(self.active.keys()):
+            state = self.active.get(symbol)
+            if not state:
+                continue
+            try:
+                klines = await data_fetcher.fetch_multi_timeframe_klines(session, symbol)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to refresh klines for %s: %s", symbol, exc)
+                continue
+
+            bars = klines.get(config.MAIN_TIMEFRAME) or []
+            if not bars:
+                continue
+
+            self._evaluate_first_bar(state, bars)
+            if symbol not in self.active:
+                continue
+
+            self._evaluate_price_target(state, bars)
+
+    def _evaluate_first_bar(self, state: ActiveSignalState, bars: list[dict]) -> None:
+        if state.first_bar_checked:
+            return
+
+        next_bar = next((bar for bar in bars if int(bar.get("close_time") or 0) > state.signal_close_time), None)
+        if not next_bar:
+            return
+
+        state.first_bar_checked = True
+        next_open = float(next_bar.get("open") or 0.0)
+        next_close = float(next_bar.get("close") or 0.0)
+        if next_close > next_open:
+            state.first_bar_passed = True
+            return
+
+        self._mark_failure(
+            state,
+            reason_code="first_bar_failed",
+            description="First 15m bar after signal closed <= open (no confirmation)",
+        )
+
+    def _evaluate_price_target(self, state: ActiveSignalState, bars: list[dict]) -> None:
+        for bar in bars:
+            close_time = int(bar.get("close_time") or 0)
+            if close_time <= state.signal_close_time:
+                continue
+            if close_time > state.deadline_close_time:
+                break
+            high_price = float(bar.get("high") or 0.0)
+            if high_price >= state.target_price:
+                logger.info("Post-signal target met for %s (+1.5%% within window)", state.symbol)
+                self.active.pop(state.symbol, None)
+                return
+
+        latest_close_time = int(bars[-1].get("close_time") or 0)
+        if latest_close_time > state.deadline_close_time:
+            self._mark_failure(
+                state,
+                reason_code="follow_through_timeout",
+                description="+1.5% target not reached within validation window",
+            )
+
+    def _mark_failure(self, state: ActiveSignalState, reason_code: str, description: str) -> None:
+        symbol = state.symbol
+        self.active.pop(symbol, None)
+        block_minutes = getattr(config, "BLOCK_DURATION_MINUTES", config.POST_SIGNAL_BLOCK_MINUTES)
+        block_until = datetime.utcnow() + timedelta(minutes=block_minutes)
+        self.blocked_until[symbol] = block_until
+        self.block_reasons[symbol] = description
+        self._failure_events.append(
+            SignalFailureEvent(
+                symbol=symbol,
+                label=state.label,
+                reason_code=reason_code,
+                description=description,
+                signal_close_time=state.signal_close_time,
+                block_expires_at=block_until,
+            )
+        )
+        logger.warning(
+            "Post-signal block applied to %s until %s (%s)",
+            symbol,
+            block_until.strftime("%H:%M"),
+            description,
+        )
+
+
