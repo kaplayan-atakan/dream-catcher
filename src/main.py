@@ -308,11 +308,14 @@ async def main_loop():
                                 logger.debug("Ignoring stablecoin signal %s", symbol)
                                 continue
 
-                            # Update cooldown
-                            last_signal_times[symbol] = datetime.now()
+                            label = signal.get('label')
                             total_signals += 1
 
-                            label = signal.get('label')
+                            # Cooldown is applied only to actionable signals.
+                            # WATCH should not block the symbol from generating future STRONG/ULTRA.
+                            if label in {"STRONG_BUY", "ULTRA_BUY"}:
+                                last_signal_times[symbol] = datetime.now()
+
                             blocked_reason = None
                             if label in {"STRONG_BUY", "ULTRA_BUY"} and signal_monitor.is_symbol_blocked(symbol):
                                 blocked_reason = signal_monitor.get_block_reason(symbol) or "Post-signal block active"
