@@ -261,13 +261,40 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
             "price_change_pct": symbol_data['price_change_pct'],
             "quote_volume": symbol_data['quote_volume'],
         }
+
+        # Build recent series for Revizyon 2 filters
+        recent_closes_15m = closes[-12:] if len(closes) >= 12 else list(closes)
+        recent_rsi_15m = [
+            r for r in rsi_values[-3:]
+            if r is not None and not np.isnan(r)
+        ] if len(rsi_values) >= 3 else []
+
+        # 1h MACD histogram series (last 3 bars if available)
+        recent_macd_hist_1h = []
+        if '1h' in klines_data and len(klines_data['1h']) >= 30:
+            htf_closes_for_hist = [k['close'] for k in klines_data['1h']]
+            _, _, htf_hist_series = indicators.macd(htf_closes_for_hist)
+            if htf_hist_series:
+                recent_macd_hist_1h = [
+                    h for h in htf_hist_series[-3:]
+                    if h is not None and not np.isnan(h)
+                ]
+
         pre_signal_context = {
             "last_close": last_close,
+            "last_open_15m": opens[-1] if opens else None,
+            "last_close_15m": last_close,
+            "ema20_15m": last_ema20,
             "ma60": last_ma60,
             "macd_1h": htf_context.get("macd_line"),
+            "macd_hist_1h": htf_context.get("macd_hist"),
             "rsi_value": last_rsi,
             "rsi_momentum_curr": rsi_momentum_current,
             "rsi_momentum_avg": rsi_momentum_avg,
+            "pa_details": pa_block.details,
+            "recent_closes_15m": recent_closes_15m,
+            "recent_rsi_15m": recent_rsi_15m,
+            "recent_macd_hist_1h": recent_macd_hist_1h,
         }
 
         signal_result = rules.decide_signal_label(

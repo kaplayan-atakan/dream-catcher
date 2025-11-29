@@ -24,6 +24,9 @@
 ## Async, Logging, and Outputs
 - Concurrency is bounded via `asyncio.Semaphore(10)` inside `process_symbol_batch`; keep API-bound work within that guard to prevent Binance bans.
 - Logging goes through `log_module` (see `logger.setup_logger()`); signals must be serialized with `log_module.log_signal_to_csv` to `signals_log.csv`. Extend CSV schemas carefully so downstream analyses stay intact.
+- Error handling standard: every recoverable exception should be caught and appended to `logs/error.log` as `ISO8601 | module | symbol(optional) | message`. Treat the file as append-only text encoded in UTF-8; never delete or truncate it from automation so post-mortem reviews stay intact. Use helpers (`log_error()` where available) instead of ad-hoc prints.
+- When any step errors, immediately fix the issue and rerun the exact failing section/command until it completes successfully; never leave an errored workflow without re-execution confirmation.
+- Spot backtest artifacts must be written as XLSX files (`spot_trades.xlsx`, `spot_summary.xlsx`) rather than CSV so analysts can consume them directly in spreadsheets.
 - Telegram support (in `src/telegram_bot.py`) is optional but wired from `main.py`. Provide `format_signal_message` that highlights block scores and reasons; respect `config.ENABLE_TELEGRAM`.
 
 ## Working Effectively

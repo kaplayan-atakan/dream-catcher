@@ -15,7 +15,7 @@ import data_fetcher
 import analyzer
 import telegram_bot
 import logger as log_module
-from signal_guard import SignalMonitor
+from signal_guard import SignalMonitor, SignalFailureEvent
 
 # Setup logging
 logger = log_module.setup_logger()
@@ -24,6 +24,33 @@ logger = log_module.setup_logger()
 last_signal_times: Dict[str, datetime] = {}
 active_symbols: Set[str] = set()
 signal_monitor = SignalMonitor()
+
+
+def _describe_failure_event(event: SignalFailureEvent) -> str:
+    if event.reason_code == "first_bar_failed":
+        core_msg = "first 15m bar after signal did not confirm (close<=open)"
+        status = "CANCELLED"
+    elif event.reason_code == "follow_through_timeout":
+        core_msg = "+1.5% target not reached within 12x15m bars"
+        status = "INVALIDATED"
+    else:
+        core_msg = event.description
+        status = "FAILED"
+    expiry_str = event.block_expires_at.strftime("%H:%M UTC")
+    return f"[{event.symbol}] {event.label} signal {status}: {core_msg}. Blocked until {expiry_str}."
+
+
+async def _handle_post_signal_failures(events: List[SignalFailureEvent], in_warmup: bool) -> None:
+    if not events:
+        return
+    for event in events:
+        message = _describe_failure_event(event)
+        logger.warning(message)
+        if config.ENABLE_TELEGRAM and not in_warmup:
+            try:
+                await telegram_bot.send_telegram_message(message)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to send Telegram failure alert for %s: %s", event.symbol, exc)
 
 
 def _build_demo_signal(label: str) -> Dict[str, object]:
@@ -298,7 +325,7 @@ async def main_loop():
             await telegram_bot.send_simple_message(
                 "🤖 Bot started! Ready to catch dreams... 🚀"
             )
-            for preview_label in ("WATCH", "STRONG_BUY", "ULTRA_BUY"):
+            for preview_label in ("STRONG_BUY", "ULTRA_BUY"):
                 demo_signal = _build_demo_signal(preview_label)
                 preview_message = telegram_bot.format_signal_message(demo_signal)
                 await telegram_bot.send_telegram_message(preview_message)
@@ -332,6 +359,9 @@ async def main_loop():
                 logger.info(f"\n🔍 Starting scan #{scan_count} at {scan_start.strftime('%H:%M:%S')}")
                 
                 await signal_monitor.evaluate_active_signals(session)
+                failure_events = signal_monitor.drain_failure_events()
+                if failure_events:
+                    await _handle_post_signal_failures(failure_events, in_warmup)
 
                 # Perform market scan
                 signals = await scan_market(session)
@@ -350,11 +380,14 @@ async def main_loop():
                                 logger.debug("Ignoring stablecoin signal %s", symbol)
                                 continue
 
-                            # Update cooldown
-                            last_signal_times[symbol] = datetime.now()
+                            label = signal.get('label')
                             total_signals += 1
 
-                            label = signal.get('label')
+                            # Cooldown is applied only to actionable signals.
+                            # WATCH should not block the symbol from generating future STRONG/ULTRA.
+                            if label in {"STRONG_BUY", "ULTRA_BUY"}:
+                                last_signal_times[symbol] = datetime.now()
+
                             blocked_reason = None
                             if label in {"STRONG_BUY", "ULTRA_BUY"} and signal_monitor.is_symbol_blocked(symbol):
                                 blocked_reason = signal_monitor.get_block_reason(symbol) or "Post-signal block active"

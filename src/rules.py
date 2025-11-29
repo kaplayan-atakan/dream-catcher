@@ -424,15 +424,25 @@ def _apply_pre_signal_filters(
         return label, []
 
     notes: List[str] = []
-
     close_price = context.get("last_close")
+    ema20_15m = context.get("ema20_15m")
+
+    # === SSR EMA20 GATE (price must be above EMA20 on 15m for STRONG/ULTRA) ===
+    if getattr(config, "ENABLE_SSR_EMA20_GATE", True):
+        if close_price is not None and ema20_15m is not None:
+            if close_price < ema20_15m:
+                notes.append("Filter: SSR blocked because price is below EMA20 on 15m")
+                downgraded = "WATCH" if score_core >= config.CORE_SCORE_WATCH_MIN else "NO_SIGNAL"
+                return downgraded, notes
+
+    # === EXISTING PRE-SIGNAL FILTERS ===
     ma60 = context.get("ma60")
     if close_price is not None and ma60 is not None and close_price < ma60:
         notes.append("Filter: Price below MA60 on 15m")
 
-    macd_1h = context.get("macd_1h")
-    if macd_1h is not None and macd_1h < config.MACD_1H_MIN_VALUE:
-        notes.append("Filter: 1h MACD below zero")
+    macd_hist_1h = context.get("macd_hist_1h")
+    if macd_hist_1h is not None and macd_hist_1h < config.MACD_1H_HIST_MIN_VALUE:
+        notes.append("Filter: 1h MACD histogram below zero")
 
     if rsi_value is not None and rsi_value <= config.RSI_PRE_FILTER_THRESHOLD:
         notes.append(
@@ -448,6 +458,56 @@ def _apply_pre_signal_filters(
     ):
         notes.append("Filter: RSI momentum not exceeding 10-bar avg")
 
+    # === REVIZYON 1: LATE SPIKE / OVEREXTENSION GUARD ===
+    if getattr(config, "ENABLE_LATE_SPIKE_FILTER", False):
+        pa_details = context.get("pa_details") or {}
+        overextended = pa_details.get("overextended_vs_ema", False)
+        dist_pct = pa_details.get("dist_from_ema_pct", 0.0)
+        parabolic = pa_details.get("parabolic_runup", False)
+        runup_pct = pa_details.get("runup_from_recent_low_pct", 0.0)
+
+        if getattr(config, "ENABLE_OVEREXTENSION_FILTER", True) and overextended:
+            notes.append(f"Filter: Overextended (+{dist_pct:.2f}% vs EMA20)")
+        if getattr(config, "ENABLE_PARABOLIC_SPIKE_FILTER", True) and parabolic:
+            notes.append(f"Filter: Parabolic runup (+{runup_pct:.2f}% from low)")
+
+    # === REVIZYON 2.1: CANDLE DIRECTION GUARD (last 15m bar must be green) ===
+    if getattr(config, "ENABLE_CANDLE_DIRECTION_FILTER", False):
+        last_open = context.get("last_open_15m")
+        last_close_15m = context.get("last_close_15m")
+        if last_open is not None and last_close_15m is not None:
+            if last_close_15m <= last_open:
+                notes.append("Filter: Last 15m candle is not green (no follow-through)")
+
+    # === REVIZYON 2.2: MOMENTUM TURNING FILTER (price + RSI + MACD histogram must turn up) ===
+    if getattr(config, "ENABLE_MOMENTUM_TURNING_FILTER", False):
+        closes_15m = context.get("recent_closes_15m") or []
+        rsi_series = context.get("recent_rsi_15m") or []
+        macd_hist_series = context.get("recent_macd_hist_1h") or []
+
+        if len(closes_15m) >= 2 and len(rsi_series) >= 2 and len(macd_hist_series) >= 2:
+            price_turns_up = closes_15m[-1] > closes_15m[-2]
+            rsi_turns_up = rsi_series[-1] > rsi_series[-2]
+            macd_hist_turns_up = macd_hist_series[-1] > macd_hist_series[-2]
+
+            if not (price_turns_up and rsi_turns_up and macd_hist_turns_up):
+                notes.append("Filter: Momentum not coherently turning up (price/RSI/MACD hist)")
+
+    # === REVIZYON 2.3: LOCAL BOTTOM DETECTION ===
+    if getattr(config, "ENABLE_LOCAL_BOTTOM_FILTER", False):
+        closes_15m = context.get("recent_closes_15m") or []
+        lookback = getattr(config, "LOCAL_BOTTOM_LOOKBACK", 8)
+        if len(closes_15m) >= lookback:
+            last_n = closes_15m[-lookback:]
+            if len(last_n) >= 2:
+                penultimate = last_n[-2]
+                last_close_val = last_n[-1]
+                if penultimate != min(last_n):
+                    notes.append(f"Filter: No local bottom detected in last {lookback} bars")
+                elif last_close_val <= penultimate:
+                    notes.append("Filter: No bounce after local bottom")
+
+    # === DOWNGRADE IF ANY FILTER TRIGGERED ===
     if not notes:
         return label, []
 
