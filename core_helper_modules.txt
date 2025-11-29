@@ -1212,9 +1212,9 @@ def _apply_pre_signal_filters(
         parabolic = pa_details.get("parabolic_runup", False)
         runup_pct = pa_details.get("runup_from_recent_low_pct", 0.0)
 
-        if overextended:
+        if getattr(config, "ENABLE_OVEREXTENSION_FILTER", True) and overextended:
             notes.append(f"Filter: Overextended (+{dist_pct:.2f}% vs EMA20)")
-        if parabolic:
+        if getattr(config, "ENABLE_PARABOLIC_SPIKE_FILTER", True) and parabolic:
             notes.append(f"Filter: Parabolic runup (+{runup_pct:.2f}% from low)")
 
     # === REVIZYON 2.1: CANDLE DIRECTION GUARD (last 15m bar must be green) ===
@@ -1242,14 +1242,14 @@ def _apply_pre_signal_filters(
     # === REVIZYON 2.3: LOCAL BOTTOM DETECTION ===
     if getattr(config, "ENABLE_LOCAL_BOTTOM_FILTER", False):
         closes_15m = context.get("recent_closes_15m") or []
-        lookback = getattr(config, "LOCAL_BOTTOM_LOOKBACK", 10)
+        lookback = getattr(config, "LOCAL_BOTTOM_LOOKBACK", 8)
         if len(closes_15m) >= lookback:
             last_n = closes_15m[-lookback:]
             if len(last_n) >= 2:
                 penultimate = last_n[-2]
                 last_close_val = last_n[-1]
                 if penultimate != min(last_n):
-                    notes.append("Filter: No local bottom detected in last 10 bars")
+                    notes.append(f"Filter: No local bottom detected in last {lookback} bars")
                 elif last_close_val <= penultimate:
                     notes.append("Filter: No bounce after local bottom")
 
@@ -1305,7 +1305,7 @@ MAX_SYMBOLS_PER_SCAN = 50  # Limit to top 50 by volume
 
 # Pre-signal gating filters
 MA60_PERIOD = 60
-RSI_PRE_FILTER_THRESHOLD = 50.0
+RSI_PRE_FILTER_THRESHOLD = 48.0
 RSI_MOMENTUM_LOOKBACK = 10
 RSI_MOMENTUM_MIN_MULTIPLIER = 1.02
 MACD_1H_MIN_VALUE = 0.0
@@ -1313,6 +1313,8 @@ MACD_1H_HIST_MIN_VALUE = 0.0
 
 # === LATE SPIKE / OVEREXTENSION GUARD (Revizyon 1) ===
 ENABLE_LATE_SPIKE_FILTER = True
+ENABLE_OVEREXTENSION_FILTER = True
+ENABLE_PARABOLIC_SPIKE_FILTER = False
 EXHAUSTION_LOOKBACK = 8
 LATE_PUMP_EMA_DIST_PCT = 3.0
 LATE_PUMP_RUNUP_PCT = 8.0
@@ -1321,7 +1323,7 @@ LATE_PUMP_RUNUP_PCT = 8.0
 ENABLE_CANDLE_DIRECTION_FILTER = True
 ENABLE_MOMENTUM_TURNING_FILTER = True
 ENABLE_LOCAL_BOTTOM_FILTER = True
-LOCAL_BOTTOM_LOOKBACK = 10
+LOCAL_BOTTOM_LOOKBACK = 8
 
 # Post-signal validation
 FOLLOW_THROUGH_TARGET_MULTIPLIER = 1.015  # Require +1.5% within validation window

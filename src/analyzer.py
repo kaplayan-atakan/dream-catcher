@@ -284,6 +284,7 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
             "last_close": last_close,
             "last_open_15m": opens[-1] if opens else None,
             "last_close_15m": last_close,
+            "ema20_15m": last_ema20,
             "ma60": last_ma60,
             "macd_1h": htf_context.get("macd_line"),
             "macd_hist_1h": htf_context.get("macd_hist"),

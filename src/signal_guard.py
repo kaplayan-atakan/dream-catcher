@@ -158,7 +158,7 @@ class SignalMonitor:
                 break
             high_price = float(bar.get("high") or 0.0)
             if high_price >= state.target_price:
-                logger.info("Post-signal target met for %s (+1.5%% within window)", state.symbol)
+                logger.info("Post-signal target met for %s (+0.8%% within window)", state.symbol)
                 self.active.pop(state.symbol, None)
                 return
 
@@ -167,7 +167,7 @@ class SignalMonitor:
             self._mark_failure(
                 state,
                 reason_code="follow_through_timeout",
-                description="+1.5% target not reached within validation window",
+                description="+0.8% target not reached within validation window",
             )
 
     def _mark_failure(self, state: ActiveSignalState, reason_code: str, description: str) -> None:

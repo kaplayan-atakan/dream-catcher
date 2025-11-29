@@ -424,10 +424,18 @@ def _apply_pre_signal_filters(
         return label, []
 
     notes: List[str] = []
+    close_price = context.get("last_close")
+    ema20_15m = context.get("ema20_15m")
+
+    # === SSR EMA20 GATE (price must be above EMA20 on 15m for STRONG/ULTRA) ===
+    if getattr(config, "ENABLE_SSR_EMA20_GATE", True):
+        if close_price is not None and ema20_15m is not None:
+            if close_price < ema20_15m:
+                notes.append("Filter: SSR blocked because price is below EMA20 on 15m")
+                downgraded = "WATCH" if score_core >= config.CORE_SCORE_WATCH_MIN else "NO_SIGNAL"
+                return downgraded, notes
 
     # === EXISTING PRE-SIGNAL FILTERS ===
-
-    close_price = context.get("last_close")
     ma60 = context.get("ma60")
     if close_price is not None and ma60 is not None and close_price < ma60:
         notes.append("Filter: Price below MA60 on 15m")
