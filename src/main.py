@@ -26,6 +26,73 @@ active_symbols: Set[str] = set()
 signal_monitor = SignalMonitor()
 
 
+def _build_demo_signal(label: str) -> Dict[str, object]:
+    """Return a canned signal payload for Telegram previews."""
+    profiles = {
+        "STRONG_BUY": {
+            "symbol": "DEMO_STRONG",
+            "price": 1.245,
+            "change": 3.2,
+            "volume": 48_000_000,
+            "trend": 5,
+            "osc": 4,
+            "vol": 3,
+            "pa": 1,
+            "core": 12,
+            "htf": 3,
+            "total": 15,
+        },
+        "ULTRA_BUY": {
+            "symbol": "DEMO_ULTRA",
+            "price": 3.578,
+            "change": 6.4,
+            "volume": 95_000_000,
+            "trend": 5,
+            "osc": 4,
+            "vol": 4,
+            "pa": 2,
+            "core": 15,
+            "htf": 4,
+            "total": 19,
+        },
+    }
+
+    profile = profiles.get(label, profiles["WATCH"])
+    return {
+        "symbol": profile["symbol"],
+        "label": label,
+        "price": profile["price"],
+        "price_change_pct": profile["change"],
+        "quote_volume": profile["volume"],
+        "trend_score": profile["trend"],
+        "osc_score": profile["osc"],
+        "vol_score": profile["vol"],
+        "pa_score": profile["pa"],
+        "score_core": profile["core"],
+        "htf_bonus": profile["htf"],
+        "score_total": profile["total"],
+        "trend_details": {"fourh_ema20_slope_pct": 1.2},
+        "htf_details": {
+            "close_above_ema20": True,
+            "ema20_slope_pct": 0.9,
+            "macd_hist": 0.004,
+        },
+        "vol_details": {
+            "volume_spike": True,
+            "volume_spike_factor": 1.6,
+            "obv_change_pct": 2.5,
+            "bull_power": 0.0032,
+            "bear_power": -0.0011,
+        },
+        "risk_tag": None,
+        "reasons": [
+            "Strong trend alignment",
+            "Volume expansion confirmed",
+            "Momentum shift in progress",
+        ],
+    }
+
+
 def _log_prefilter_density(total_pairs: int, kept_pairs: int) -> None:
     """Emit Phase 3 transparency hints about how strict the current filters are."""
     if total_pairs <= 0:
@@ -226,13 +293,18 @@ async def main_loop():
     warmup_notice_logged = False
     warmup_complete_logged = False
 
-    # if config.ENABLE_TELEGRAM:
-    #     try:
-    #         await telegram_bot.send_telegram_message(
-    #             "Hadi, başlıyorum! Hazır mıyız? Time to fly 🚀"
-    #         )
-    #     except Exception as exc:  # noqa: BLE001
-    #         logger.warning(f"Failed to send Telegram start message: {exc}")
+    if config.ENABLE_TELEGRAM:
+        try:
+            await telegram_bot.send_simple_message(
+                "🤖 Bot started! Ready to catch dreams... 🚀"
+            )
+            for preview_label in ("WATCH", "STRONG_BUY", "ULTRA_BUY"):
+                demo_signal = _build_demo_signal(preview_label)
+                preview_message = telegram_bot.format_signal_message(demo_signal)
+                await telegram_bot.send_telegram_message(preview_message)
+                await asyncio.sleep(0.3)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Failed to send Telegram start message: {exc}")
     
     # Create persistent session with connection pooling
     connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
@@ -291,6 +363,7 @@ async def main_loop():
                                 logger.info("Blocking STRONG/ULTRA for %s due to %s", symbol, blocked_reason)
 
                             should_notify = label in {"STRONG_BUY", "ULTRA_BUY"}
+                            should_register = label in {"STRONG_BUY", "ULTRA_BUY"}
                             
                             # Log to CSV
                             log_module.log_signal_to_csv(
@@ -339,7 +412,7 @@ async def main_loop():
                                 for note in filter_notes:
                                     logger.info("   %s", note)
 
-                            if should_notify:
+                            if should_register:
                                 signal_monitor.register_signal(signal)
                             
                         except Exception as e:

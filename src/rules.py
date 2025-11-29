@@ -1,6 +1,6 @@
 """Rule-based scoring aligned with the revised Phase 3 spec."""
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import config
 
@@ -418,7 +418,7 @@ def _apply_pre_signal_filters(
     score_core: int,
     rsi_value: float,
     context: Dict[str, Any],
-) -> tuple[str, List[str]]:
+) -> Tuple[str, List[str]]:
     """Downgrade STRONG/ULTRA labels when guardrails fail."""
     if label not in {"STRONG_BUY", "ULTRA_BUY"}:
         return label, []
