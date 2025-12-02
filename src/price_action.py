@@ -331,7 +331,7 @@ def check_support_levels(
         - support_level: The detected support level
     """
     import numpy as np  # Local import to avoid circular dependency
-    from . import config
+    import config
     
     result = {
         "near_ema20_support": False,
