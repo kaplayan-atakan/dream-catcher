@@ -186,7 +186,63 @@ CCI_STRONG_THRESHOLD = 100
 STOCH_RSI_BULL_LEVEL = 50
 UO_RISING_MIN_DELTA = 0.5
 
+# === DİP YAKALAMA FİLTRELERİ / BOTTOM-FISHING FILTERS ===
+ENABLE_BOTTOM_FISHING = True  # Master toggle for dip-focused logic
+
+# RSI dip zone
+RSI_OVERSOLD_ZONE = 35        # r < 35 considered oversold
+RSI_RECOVERY_MIN = 38         # Early recovery level from oversold
+RSI_OVERSOLD_EXIT = 40        # Full exit from oversold
+
+# Stochastic recovery
+STOCH_OVERSOLD_EXIT = 25      # Exiting oversold region
+STOCH_RECOVERY = 30           # Recovery confirmation level
+
+# Price action dip patterns
+REQUIRE_HAMMER_OR_ENGULFING = True
+MIN_BOUNCE_FROM_SUPPORT = 0.5  # 0.5% bounce from EMA/support
+
+# Volume confirmation on bounce
+REQUIRE_VOLUME_INCREASE_ON_BOUNCE = True
+MIN_VOLUME_INCREASE_RATIO = 1.3  # 30% increase vs prior bar
+
+# Support level detection
+SUPPORT_EMA_PROXIMITY_PCT = 1.5  # 1.5% proximity to EMA20 for support
+SUPPORT_LOOKBACK_BARS = 20       # Recent lows lookback
+
+# Momentum shift detection
+REQUIRE_MOMENTUM_SHIFT = True    # Require clear upward shift from dip
+MIN_RSI_RISE_LAST_3 = 3          # RSI gained at least 3 points in last 3 bars
+MOMENTUM_SHIFT_LOOKBACK = 5      # Bars to look back for oversold condition
+
+# Dip bonus scoring
+DIP_REVERSAL_BONUS = 2           # Bonus for reversal pattern detection
+SUPPORT_BOUNCE_BONUS = 1         # Bonus for bouncing from support
+EMA_SUPPORT_BONUS = 1            # Bonus for near EMA20 support
+RSI_RECOVERY_BONUS = 2           # Bonus for RSI exiting oversold
+
+# Top filter (avoid late entries)
+ENABLE_TOP_FILTER = True         # Downgrade signals at overbought tops
+RSI_TOP_THRESHOLD = 70           # RSI above this = momentum exhausted
+
+# MACD histogram turning detection
+MACD_HIST_NEG_TO_POS_BARS = 3    # Lookback bars for histogram neg→pos turn
+
+# Momentum shift detection master toggle
+ENABLE_MOMENTUM_SHIFT_DETECTION = True
+
 # Backtest
 BACKTEST_TP_PERCENTS = [2.0, 3.0, 5.0, 10.0]
 BACKTEST_SL_PERCENTS = [1.0, 2.0, 3.0]
 BACKTEST_LOOKAHEAD_BARS = 96
+
+# === PREFILTER RELAXATION (when bottom-fishing is enabled) ===
+# These overrides allow catching dip reversals that would otherwise be filtered out
+if ENABLE_BOTTOM_FISHING:
+    MIN_24H_QUOTE_VOLUME = 5_000_000   # $5M (relaxed from $10M)
+    MAX_SYMBOLS_PER_SCAN = 100          # Increased from 50
+    COOLDOWN_MINUTES = 30               # Reduced from 60
+    MAX_24H_CHANGE = 8.0                # Reduced from 20%
+    MIN_24H_CHANGE = -5.0               # Relaxed from -10%
+    RSI_STRONG_MIN = 38                 # Lowered from 50 for earlier entries
+    RSI_STRONG_MAX = 55                 # Lowered from 65 to avoid late entries

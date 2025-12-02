@@ -334,6 +334,9 @@ def decide_signal_label(
     rsi_value: float,
     symbol: str,
     pre_signal_context: Optional[Dict[str, Any]] = None,
+    momentum_rev: Optional[Dict[str, Any]] = None,
+    reversal_pa: Optional[Dict[str, Any]] = None,
+    support_data: Optional[Dict[str, Any]] = None,
 ) -> SignalResult:
     """Aggregate block scores and label outcome per revised thresholds."""
     trend_component = trend_block.score if config.ENABLE_TREND_BLOCK else 0
@@ -343,7 +346,7 @@ def decide_signal_label(
     htf_bonus = htf_block.score if htf_block else 0
 
     score_core = trend_component + osc_component + vol_component + pa_component
-    score_total = score_core + htf_bonus
+    # score_total will be recalculated after dip_bonus is applied
 
     reasons: List[str] = []
     if config.ENABLE_TREND_BLOCK:
@@ -356,6 +359,60 @@ def decide_signal_label(
         reasons.extend(pa_block.reasons)
     if htf_block:
         reasons.extend(htf_block.reasons)
+
+    # === BOTTOM-FISHING: Calculate dip reversal bonus ===
+    reversal_bonus = 0
+    reversal_reasons: List[str] = []
+
+    mr = momentum_rev or {}
+    rp = reversal_pa or {}
+    sd = support_data or {}
+
+    if getattr(config, "ENABLE_BOTTOM_FISHING", False):
+        # Momentum reversal bonuses
+        if mr:
+            if mr.get("rsi_oversold_recovery"):
+                reversal_bonus += 2
+                reversal_reasons.append("RSI recovering from oversold")
+            if mr.get("stoch_cross_up"):
+                reversal_bonus += 2
+                reversal_reasons.append("Stoch rising from low zone")
+            if mr.get("macd_hist_turning"):
+                reversal_bonus += 2
+                reversal_reasons.append("MACD histogram turning up from negative")
+            if mr.get("rsi_rising_3bars"):
+                reversal_bonus += 1
+                rrise = mr.get("details", {}).get("rsi_rise_3bars")
+                if rrise is not None:
+                    reversal_reasons.append(f"RSI +{rrise:.1f} over last 3 bars")
+
+        # Reversal candle pattern bonuses
+        if rp.get("has_reversal"):
+            reversal_bonus += 2
+            patterns = []
+            if rp.get("hammer"):
+                patterns.append("hammer")
+            if rp.get("bullish_engulfing"):
+                patterns.append("bullish_engulfing")
+            if rp.get("morning_star"):
+                patterns.append("morning_star")
+            if patterns:
+                reversal_reasons.append("Reversal candles: " + ", ".join(patterns))
+
+        # Support level bonuses
+        if sd:
+            if sd.get("bounced_from_support"):
+                reversal_bonus += 1
+                reversal_reasons.append("Bounce from recent support")
+            if sd.get("near_ema20_support"):
+                reversal_bonus += 1
+                reversal_reasons.append("Near EMA20 support")
+
+    # Add reversal bonus to total score
+    score_total = score_core + htf_bonus + reversal_bonus
+
+    # Add reversal reasons to main reasons list
+    reasons.extend(reversal_reasons[:2])  # Limit to avoid clutter
 
     label = "NO_SIGNAL"
     if score_core < config.CORE_SCORE_WATCH_MIN:
@@ -376,6 +433,29 @@ def decide_signal_label(
         and htf_bonus >= config.HTF_MIN_FOR_ULTRA
     ):
         label = "ULTRA_BUY"
+
+    # === TOP FILTER: Downgrade overbought / late entries ===
+    if getattr(config, "ENABLE_TOP_FILTER", False):
+        rsi_top = getattr(config, "RSI_TOP_THRESHOLD", 70)
+        if rsi_value > 65:
+            if label == "ULTRA_BUY":
+                label = "STRONG_BUY"
+                reasons.append("RSI >65: momentum likely exhausted (ULTRA → STRONG)")
+            elif label == "STRONG_BUY":
+                label = "WATCH"
+                reasons.append("RSI >65: momentum likely exhausted (STRONG → WATCH)")
+
+        price_change_pct = meta.get("price_change_pct") if isinstance(meta, dict) else None
+        if price_change_pct is not None and price_change_pct > 8.0:
+            if label in {"ULTRA_BUY", "STRONG_BUY"}:
+                label = "WATCH"
+                reasons.append("24h change > +8%: move likely overextended")
+
+    # If bottom-fishing is enabled but momentum_rev is weak, downgrade strong labels
+    if getattr(config, "ENABLE_BOTTOM_FISHING", False) and mr:
+        if mr.get("confidence_score", 0) < 3 and label in {"ULTRA_BUY", "STRONG_BUY"}:
+            label = "WATCH"
+            reasons.append("Dip momentum weak (confidence <3)")
 
     filter_notes: List[str] = []
     label, filter_notes = _apply_pre_signal_filters(

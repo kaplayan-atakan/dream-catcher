@@ -378,3 +378,75 @@ def _rolling_sum(values: np.ndarray, period: int) -> np.ndarray:
 
 def _is_valid(value: float) -> bool:
     return value is not None and not np.isnan(value)
+
+
+def detect_momentum_shift(
+    rsi_values: Sequence[float],
+    stoch_values: Sequence[float],
+    macd_hist: Sequence[float],
+) -> dict:
+    """
+    Detect the early point of momentum reversal from a dip.
+
+    Returns a dict with:
+    - momentum_shift: True when RSI was oversold recently and is now turning up,
+      Stochastic was low and is rising, MACD histogram is turning from negative.
+    - Details about each component for debugging/logging.
+    """
+    result = {
+        "momentum_shift": False,
+        "rsi_was_oversold": False,
+        "rsi_turning_up": False,
+        "stoch_was_low": False,
+        "stoch_rising": False,
+        "macd_turning": False,
+    }
+
+    lookback = getattr(config, "MOMENTUM_SHIFT_LOOKBACK", 5)
+    rsi_oversold_zone = getattr(config, "RSI_OVERSOLD_ZONE", 35)
+    stoch_oversold = getattr(config, "STOCH_OVERSOLD", 20)
+    stoch_exit = getattr(config, "STOCH_OVERSOLD_EXIT", 25)
+
+    if len(rsi_values) < lookback or len(stoch_values) < lookback or len(macd_hist) < 3:
+        return result
+
+    # Filter out NaN values
+    rsi_recent = [r for r in rsi_values[-lookback:] if _is_valid(r)]
+    stoch_recent = [s for s in stoch_values[-lookback:] if _is_valid(s)]
+    macd_recent = [m for m in macd_hist[-3:] if _is_valid(m)]
+
+    if len(rsi_recent) < 3 or len(stoch_recent) < 3 or len(macd_recent) < 3:
+        return result
+
+    # RSI: oversold in recent past and now turning up
+    rsi_current = rsi_recent[-1]
+    rsi_prev = rsi_recent[-2]
+    rsi_was_oversold = any(r < rsi_oversold_zone for r in rsi_recent[:-1])
+    rsi_turning_up = rsi_current > rsi_prev and (len(rsi_recent) < 3 or rsi_prev > rsi_recent[-3])
+
+    # Stochastic: exited oversold and rising
+    stoch_current = stoch_recent[-1]
+    stoch_was_low = any(s < stoch_oversold for s in stoch_recent[:-1])
+    stoch_rising = stoch_current > stoch_recent[-2] and stoch_current > stoch_exit
+
+    # MACD histogram: turning from negative to rising
+    macd_turning = (
+        macd_recent[-3] < 0
+        and macd_recent[-2] < 0
+        and macd_recent[-1] > macd_recent[-2]
+    )
+
+    result.update({
+        "rsi_was_oversold": rsi_was_oversold,
+        "rsi_turning_up": rsi_turning_up,
+        "stoch_was_low": stoch_was_low,
+        "stoch_rising": stoch_rising,
+        "macd_turning": macd_turning,
+        "momentum_shift": (
+            rsi_was_oversold and rsi_turning_up
+            and stoch_was_low and stoch_rising
+            and macd_turning
+        ),
+    })
+
+    return result

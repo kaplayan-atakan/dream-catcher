@@ -8,6 +8,7 @@ import numpy as np
 
 import indicators
 import price_action
+import momentum_shift
 import rules
 import data_fetcher
 import config
@@ -280,6 +281,28 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
                     if h is not None and not np.isnan(h)
                 ]
 
+        # === BOTTOM-FISHING: Momentum shift detection ===
+        momentum_rev = {}
+        if getattr(config, "ENABLE_MOMENTUM_SHIFT_DETECTION", False):
+            momentum_rev = momentum_shift.detect_momentum_shift(
+                rsi_values=rsi_values,
+                stoch_k_values=stoch_k_values,
+                macd_hist=macd_hist,
+                current_rsi=last_rsi,
+                price_change_pct=symbol_data['price_change_pct'],
+            )
+            logger.debug(
+                "[%s] Momentum reversal confidence: %s",
+                symbol,
+                momentum_rev.get("confidence_score"),
+            )
+
+        # === BOTTOM-FISHING: Reversal candles (already in pa_signals) ===
+        reversal_pa = price_action.detect_reversal_candles(opens, highs, lows, closes)
+
+        # === BOTTOM-FISHING: Support level checks ===
+        support_data = price_action.check_support_levels(closes, lows, ema20_values)
+
         pre_signal_context = {
             "last_close": last_close,
             "last_open_15m": opens[-1] if opens else None,
@@ -295,6 +318,9 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
             "recent_closes_15m": recent_closes_15m,
             "recent_rsi_15m": recent_rsi_15m,
             "recent_macd_hist_1h": recent_macd_hist_1h,
+            "momentum_rev": momentum_rev,
+            "reversal_pa": reversal_pa,
+            "support_data": support_data,
         }
 
         signal_result = rules.decide_signal_label(
@@ -307,6 +333,9 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
             rsi_value=last_rsi,
             symbol=symbol,
             pre_signal_context=pre_signal_context,
+            momentum_rev=momentum_rev,
+            reversal_pa=reversal_pa,
+            support_data=support_data,
         )
         
         # Add market data to result

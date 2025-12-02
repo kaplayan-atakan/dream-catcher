@@ -87,6 +87,18 @@ def analyze_price_action(
             runup_from_recent_low_pct = (close_val / recent_low - 1.0) * 100
             parabolic_runup = runup_from_recent_low_pct >= config.LATE_PUMP_RUNUP_PCT
 
+    # === REVERSAL CANDLE PATTERNS (Bottom-fishing) ===
+    reversal_signals = detect_reversal_candles(opens, highs, lows, closes)
+
+    # === VOLUME INCREASE ON BOUNCE ===
+    volume_increase_on_bounce = False
+    if len(volumes) >= 2:
+        prev_vol = volumes[-2]
+        curr_vol = volumes[-1]
+        min_ratio = getattr(config, "MIN_VOLUME_INCREASE_RATIO", 1.3)
+        if prev_vol > 0 and curr_vol >= prev_vol * min_ratio:
+            volume_increase_on_bounce = True
+
     pa_details = {
         "body_pct_vs_open": body_pct_vs_open,
         "body_pct_of_range": body_pct_of_range,
@@ -102,6 +114,9 @@ def analyze_price_action(
         "parabolic_runup": parabolic_runup,
         "dist_from_ema_pct": dist_from_ema_pct,
         "runup_from_recent_low_pct": runup_from_recent_low_pct,
+        "reversal_patterns": reversal_signals,
+        "has_reversal": reversal_signals.get("has_reversal", False),
+        "volume_increase_on_bounce": volume_increase_on_bounce,
     }
 
     return {
@@ -226,3 +241,135 @@ def _check_volume_spike(volumes: Sequence[float]) -> Tuple[bool, float, float]:
     current = volumes[-1]
     factor = current / avg_volume if avg_volume else 0.0
     return current >= avg_volume * config.VOLUME_SPIKE_MULTIPLIER, factor, avg_volume
+
+
+def detect_reversal_candles(
+    opens: Sequence[float],
+    highs: Sequence[float],
+    lows: Sequence[float],
+    closes: Sequence[float],
+) -> Dict[str, object]:
+    """
+    Detect basic bullish reversal patterns:
+    - Hammer (long lower wick, small body, green candle)
+    - Bullish Engulfing (red followed by larger green that engulfs)
+    - Morning Star (3-candle: red, small body, green closing above midpoint)
+    """
+    result = {
+        "hammer": False,
+        "bullish_engulfing": False,
+        "morning_star": False,
+        "has_reversal": False,
+    }
+
+    if len(closes) < 3:
+        return result
+
+    o1, h1, l1, c1 = opens[-3], highs[-3], lows[-3], closes[-3]
+    o2, h2, l2, c2 = opens[-2], highs[-2], lows[-2], closes[-2]
+    o3, h3, l3, c3 = opens[-1], highs[-1], lows[-1], closes[-1]
+
+    # Hammer detection (current bar)
+    body3 = abs(c3 - o3)
+    lower_wick3 = min(o3, c3) - l3
+    upper_wick3 = h3 - max(o3, c3)
+    total_range3 = h3 - l3
+
+    is_hammer = (
+        c3 > o3  # Green candle
+        and total_range3 > 0
+        and lower_wick3 > body3 * 2.0  # Lower wick at least 2x body
+        and upper_wick3 < body3 * 0.3  # Small upper wick
+    )
+
+    # Bullish Engulfing (previous bar red, current bar green and engulfs)
+    is_engulfing = (
+        c2 < o2  # Previous candle red
+        and c3 > o3  # Current candle green
+        and o3 < c2  # Open below previous close
+        and c3 > o2  # Close above previous open
+    )
+
+    # Morning Star (3-candle pattern)
+    first_body = abs(c1 - o1)
+    is_morning_star = (
+        c1 < o1  # First candle red
+        and first_body > 0
+        and abs(c2 - o2) < first_body * 0.3  # Small middle candle
+        and c3 > o3  # Last candle green
+        and c3 > (o1 + c1) / 2  # Closes above midpoint of first candle
+    )
+
+    result.update({
+        "hammer": bool(is_hammer),
+        "bullish_engulfing": bool(is_engulfing),
+        "morning_star": bool(is_morning_star),
+        "has_reversal": bool(is_hammer or is_engulfing or is_morning_star),
+    })
+
+    return result
+
+
+def check_support_levels(
+    closes: Sequence[float],
+    lows: Sequence[float],
+    ema20_values: Sequence[float],
+) -> Dict[str, object]:
+    """
+    Check for EMA20 and recent low support.
+    Returns flags for near_ema20_support, bounced_from_support, and the support level.
+    
+    Args:
+        closes: List of closing prices
+        lows: List of low prices
+        ema20_values: List of EMA20 values
+        
+    Returns:
+        Dict containing:
+        - near_ema20_support: True if price is near EMA20
+        - bounced_from_support: True if price recently bounced from support
+        - support_level: The detected support level
+    """
+    import numpy as np  # Local import to avoid circular dependency
+    from . import config
+    
+    result = {
+        "near_ema20_support": False,
+        "bounced_from_support": False,
+        "support_level": None,
+    }
+
+    lookback = getattr(config, "SUPPORT_LOOKBACK_BARS", 20)
+    proximity_pct = getattr(config, "SUPPORT_EMA_PROXIMITY_PCT", 1.5) / 100.0
+
+    if len(closes) < lookback or len(lows) < lookback:
+        return result
+
+    # Filter out NaN from ema20
+    valid_ema = [e for e in list(ema20_values)[-lookback:] if e is not None and not np.isnan(e)]
+    if not valid_ema:
+        return result
+
+    current_price = closes[-1]
+    ema20_current = valid_ema[-1]
+
+    # Near EMA20 support: within proximity_pct of EMA20
+    if ema20_current > 0:
+        near_ema20 = abs(current_price - ema20_current) / ema20_current < proximity_pct
+        result["near_ema20_support"] = near_ema20
+
+    # Support level from recent lows
+    recent_lows = list(lows)[-lookback:]
+    support_level = min(recent_lows)
+    result["support_level"] = support_level
+
+    # Bounced from support: price is now above support and recently touched it
+    min_bounce_pct = getattr(config, "MIN_BOUNCE_FROM_SUPPORT", 0.5) / 100.0
+    if support_level > 0:
+        bounced = (
+            current_price > support_level * (1 + min_bounce_pct)
+            and min(list(lows)[-3:]) <= support_level * 1.01
+        )
+        result["bounced_from_support"] = bounced
+
+    return result
