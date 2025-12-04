@@ -24,7 +24,12 @@ _DEFAULT_EMOJI = "🔔"
 
 def _escape_markdown(text: str) -> str:
     """Escape special characters for Telegram MarkdownV2"""
-    special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    if text is None:
+        return ""
+    text = str(text)
+    # Order matters: escape backslash first to avoid double-escaping
+    text = text.replace('\\', '\\\\')
+    special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '<', '#', '+', '-', '=', '|', '{', '}', '.', '!', '&']
     for char in special_chars:
         text = text.replace(char, f'\\{char}')
     return text
@@ -210,6 +215,12 @@ async def send_telegram_message(text: str) -> None:
         logger.warning("Telegram enabled but credentials missing; skipping send")
         return
 
+    # Truncate message if too long (Telegram limit is 4096 chars)
+    max_length = 4000  # Leave some margin
+    if len(text) > max_length:
+        text = text[:max_length] + "\n\n\.\.\. \(truncated\)"
+        logger.warning("Message truncated to %d characters", max_length)
+
     url = f"{_TELEGRAM_API}/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": config.TELEGRAM_CHAT_ID,
@@ -221,9 +232,32 @@ async def send_telegram_message(text: str) -> None:
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, json=payload) as resp:
-                resp.raise_for_status()
+                if resp.status == 400:
+                    # MarkdownV2 parse error - try sending as plain text
+                    error_data = await resp.json()
+                    logger.warning("MarkdownV2 parse failed: %s, retrying as plain text", error_data.get('description', 'Unknown error'))
+                    # Remove markdown formatting and send as plain text
+                    plain_text = _strip_markdown(text)
+                    payload_plain = {
+                        "chat_id": config.TELEGRAM_CHAT_ID,
+                        "text": plain_text,
+                    }
+                    async with session.post(url, json=payload_plain) as resp2:
+                        resp2.raise_for_status()
+                else:
+                    resp.raise_for_status()
     except Exception as exc:  # noqa: BLE001
         logger.warning("Telegram send failed: %s", exc)
+
+
+def _strip_markdown(text: str) -> str:
+    """Remove MarkdownV2 escape characters for plain text fallback."""
+    # Remove backslash escapes
+    import re
+    text = re.sub(r'\\([_*\[\]()~`>#+\-=|{}.!<&])', r'\1', text)
+    # Remove bold/italic markers
+    text = text.replace('*', '').replace('_', '')
+    return text
 
 
 async def send_simple_message(text: str) -> None:
