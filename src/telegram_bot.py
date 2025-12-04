@@ -22,25 +22,12 @@ _LABEL_EMOJI = {
 _DEFAULT_EMOJI = "🔔"
 
 
-def _escape_markdown(text: str) -> str:
-    """Escape special characters for Telegram MarkdownV2"""
-    if text is None:
-        return ""
-    text = str(text)
-    # Order matters: escape backslash first to avoid double-escaping
-    text = text.replace('\\', '\\\\')
-    special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '<', '#', '+', '-', '=', '|', '{', '}', '.', '!', '&']
-    for char in special_chars:
-        text = text.replace(char, f'\\{char}')
-    return text
-
-
 def format_signal_message(
     signal: Dict[str, object],
     display_label: str | None = None,
     info_note: str | None = None,
 ) -> str:
-    """Return a beautifully formatted signal message with optional display label overrides."""
+    """Return a beautifully formatted signal message (plain text, no Markdown)."""
     price = signal.get("price")
     change = signal.get("price_change_pct")
     quote_vol = signal.get("quote_volume")
@@ -70,27 +57,28 @@ def format_signal_message(
     if label == "ULTRA_BUY":
         header_emoji = "🚀🔥"
         divider = "━━━━━━━━━━━━━━━━━━━━"
-        signal_type = "*ULTRA BUY*"
+        signal_type = "ULTRA BUY"
     elif label == "STRONG_BUY":
         header_emoji = "📈💎"
         divider = "━━━━━━━━━━━━━━━━━━━━"
-        signal_type = "*STRONG BUY*"
-    elif label == config.WATCH_PREMIUM_TG_LABEL:
+        signal_type = "STRONG BUY"
+    elif label == config.WATCH_PREMIUM_TG_LABEL or "WATCH_PREMIUM" in str(label):
         header_emoji = "🔔🌟"
         divider = "━━━━━━━━━━━━━━━━━━━━"
-        signal_type = "*WATCH_PREMIUM*"
+        signal_type = "WATCH PREMIUM"
+    elif "DIP_ALERT" in str(label):
+        header_emoji = "🎯💰"
+        divider = "━━━━━━━━━━━━━━━━━━━━"
+        signal_type = "DIP ALERT"
     else:  # WATCH
         header_emoji = "👀📊"
         divider = "━━━━━━━━━━━━━━━━━━━━"
-        signal_type = "*WATCH*"
+        signal_type = "WATCH"
     
-    # Escape special characters for MarkdownV2
-    symbol_escaped = _escape_markdown(symbol)
-    
-    # Build message
+    # Build message (plain text - no Markdown)
     lines = [
         f"{header_emoji} {signal_type}",
-        f"*{symbol_escaped}*",
+        f"{symbol}",
         divider,
     ]
     
@@ -100,38 +88,33 @@ def format_signal_message(
     vol_val = float(quote_vol) if quote_vol is not None else 0.0
     
     change_emoji = "🟢" if change_val >= 0 else "🔴"
-    price_str = _escape_markdown(f"${price_val:.6f}")
-    change_str = _escape_markdown(f"{change_val:+.2f}%")
-    vol_str = _escape_markdown(f"${vol_val:,.0f}")
     
-    lines.append(f"💰 Price: {price_str}")
-    lines.append(f"{change_emoji} 24h Change: {change_str}")
-    lines.append(f"📊 Volume: {vol_str}")
+    lines.append(f"💰 Price: ${price_val:.6f}")
+    lines.append(f"{change_emoji} 24h Change: {change_val:+.2f}%")
+    lines.append(f"📊 Volume: ${vol_val:,.0f}")
     lines.append(divider)
     
-    # Scores section with bold total and highest category
-    lines.append("*📈 SCORES*")
+    # Scores section
+    lines.append("📈 SCORES")
     
     # Individual scores with highlighting for max category
     for cat_name, cat_score in score_categories.items():
         if cat_name == max_category[0]:
-            lines.append(f"  *{_escape_markdown(cat_name)}*: *{cat_score}* ⭐")
+            lines.append(f"  {cat_name}: {cat_score} ⭐")
         else:
-            lines.append(f"  {_escape_markdown(cat_name)}: {cat_score}")
+            lines.append(f"  {cat_name}: {cat_score}")
     
     lines.append("")
     lines.append(f"Core Score: {core_score}")
-    lines.append(f"HTF Bonus: \\+{htf_bonus}")
-    lines.append(f"*TOTAL: {total_score}* 🎯")
+    lines.append(f"HTF Bonus: +{htf_bonus}")
+    lines.append(f"TOTAL: {total_score} 🎯")
     lines.append(divider)
-    if label == config.WATCH_PREMIUM_TG_LABEL or info_note:
+    
+    if label == config.WATCH_PREMIUM_TG_LABEL or "WATCH_PREMIUM" in str(label) or info_note:
         detail_score = total_score if total_score is not None else 0
-        detail_score_text = _escape_markdown(str(detail_score))
-        label_text = _escape_markdown(label)
-        lines.append(divider)
-        lines.append(f"• Score: {detail_score_text} | Label: {label_text} (informational)")
-        note = info_note or "Early alert only — not actionable. STRONG/ULTRA rules unchanged."
-        lines.append(f"• Note: {_escape_markdown(note)}")
+        lines.append(f"Score: {detail_score} - Label: {label} (informational)")
+        note = info_note or "Early alert only - not actionable. STRONG/ULTRA rules unchanged."
+        lines.append(f"Note: {note}")
         lines.append("")
     
     # HTF details
@@ -159,9 +142,9 @@ def format_signal_message(
         htf_bits.append(f"4h EMA20 slope {slope_val:+.1f}%")
 
     if htf_bits:
-        lines.append("*🔍 Higher Timeframes*")
+        lines.append("🔍 Higher Timeframes")
         for bit in htf_bits[:3]:
-            lines.append(f"  • {_escape_markdown(bit)}")
+            lines.append(f"  - {bit}")
         lines.append("")
     
     # Volume details
@@ -178,37 +161,37 @@ def format_signal_message(
     obv_change = vol_details.get("obv_change_pct")
     if obv_change:
         obv_val = float(obv_change)
-        vol_bits.append(f"OBV {obv_val:+.1f}%/{config.OBV_TREND_LOOKBACK} bars")
+        vol_bits.append(f"OBV {obv_val:+.1f}% / {config.OBV_TREND_LOOKBACK} bars")
 
     bull_power = vol_details.get("bull_power")
     bear_power = vol_details.get("bear_power")
     if bull_power is not None and bear_power is not None:
-        vol_bits.append(f"Bull {float(bull_power):.4f} | Bear {float(bear_power):.4f}")
+        vol_bits.append(f"Bull {float(bull_power):.4f} - Bear {float(bear_power):.4f}")
 
     if vol_bits:
-        lines.append("*💪 Volume Analysis*")
+        lines.append("💪 Volume Analysis")
         for bit in vol_bits[:3]:
-            lines.append(f"  • {_escape_markdown(bit)}")
+            lines.append(f"  - {bit}")
         lines.append("")
 
     # Risk tag
     risk_tag = signal.get("risk_tag")
     if risk_tag and risk_tag != "NORMAL":
-        lines.append(f"⚠️ *Risk*: {_escape_markdown(risk_tag)}")
+        lines.append(f"⚠️ Risk: {risk_tag}")
         lines.append("")
 
     # Top reasons
     reasons = signal.get("reasons") or []
     if reasons:
-        lines.append("*✅ Key Reasons*")
+        lines.append("✅ Key Reasons")
         for reason in reasons[:3]:
-            lines.append(f"  \\- {_escape_markdown(reason)}")
+            lines.append(f"  - {reason}")
     
     return "\n".join(lines)
 
 
 async def send_telegram_message(text: str) -> None:
-    """Send `text` to the configured Telegram chat if enabled."""
+    """Send `text` to the configured Telegram chat if enabled (plain text only)."""
     if not config.ENABLE_TELEGRAM:
         return
     if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
@@ -218,46 +201,24 @@ async def send_telegram_message(text: str) -> None:
     # Truncate message if too long (Telegram limit is 4096 chars)
     max_length = 4000  # Leave some margin
     if len(text) > max_length:
-        text = text[:max_length] + "\n\n\.\.\. \(truncated\)"
+        text = text[:max_length] + "\n\n... (truncated)"
         logger.warning("Message truncated to %d characters", max_length)
 
     url = f"{_TELEGRAM_API}/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
+    
+    # Send as plain text - no parse_mode to avoid any Markdown issues
     payload = {
         "chat_id": config.TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": "MarkdownV2",
     }
 
     timeout = aiohttp.ClientTimeout(total=15)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, json=payload) as resp:
-                if resp.status == 400:
-                    # MarkdownV2 parse error - try sending as plain text
-                    error_data = await resp.json()
-                    logger.warning("MarkdownV2 parse failed: %s, retrying as plain text", error_data.get('description', 'Unknown error'))
-                    # Remove markdown formatting and send as plain text
-                    plain_text = _strip_markdown(text)
-                    payload_plain = {
-                        "chat_id": config.TELEGRAM_CHAT_ID,
-                        "text": plain_text,
-                    }
-                    async with session.post(url, json=payload_plain) as resp2:
-                        resp2.raise_for_status()
-                else:
-                    resp.raise_for_status()
+                resp.raise_for_status()
     except Exception as exc:  # noqa: BLE001
         logger.warning("Telegram send failed: %s", exc)
-
-
-def _strip_markdown(text: str) -> str:
-    """Remove MarkdownV2 escape characters for plain text fallback."""
-    # Remove backslash escapes
-    import re
-    text = re.sub(r'\\([_*\[\]()~`>#+\-=|{}.!<&])', r'\1', text)
-    # Remove bold/italic markers
-    text = text.replace('*', '').replace('_', '')
-    return text
 
 
 async def send_simple_message(text: str) -> None:

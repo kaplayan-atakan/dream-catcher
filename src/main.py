@@ -471,7 +471,7 @@ async def main_loop():
                             
                             if original_label == "DIP_ALERT":
                                 signal_type = "DIP_ALERT"
-                                should_notify = True
+                                should_notify = getattr(config, "DIP_NOTIFY_TELEGRAM", True)
                             elif original_label == "ULTRA_BUY":
                                 signal_type = "ULTRA_BUY"
                                 should_notify = True
