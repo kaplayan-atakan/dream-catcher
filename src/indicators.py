@@ -450,3 +450,207 @@ def detect_momentum_shift(
     })
 
     return result
+
+
+def detect_early_momentum_shift(
+    rsi_values: Sequence[float],
+    macd_hist_values: Sequence[float],
+    stoch_k_values: Sequence[float],
+    stoch_d_values: Sequence[float],
+) -> dict:
+    """
+    Detect early momentum shift - signals BEFORE the move, not after.
+    
+    Conditions (ALL must be true for full detection):
+    1. RSI rising for 3 bars AND RSI[-1] in 38-48 range (dip recovery zone)
+    2. MACD histogram: hist[-3] < 0, hist[-2] < 0, hist[-1] > hist[-2] (turning up from negative)
+    3. Stoch K: K[-1] > D[-1] AND K[-1] > 20 (exiting oversold)
+    
+    Returns:
+        {
+            "detected": bool,
+            "confidence": int,  # 0-3 based on conditions met
+            "rsi_rising": bool,
+            "rsi_in_recovery_zone": bool,
+            "macd_turning_up": bool,
+            "stoch_bullish_cross": bool,
+            "details": {...}
+        }
+    """
+    result = {
+        "detected": False,
+        "confidence": 0,
+        "rsi_rising": False,
+        "rsi_in_recovery_zone": False,
+        "macd_turning_up": False,
+        "stoch_bullish_cross": False,
+        "details": {}
+    }
+    
+    rsi_arr = _to_float_array(rsi_values)
+    macd_arr = _to_float_array(macd_hist_values)
+    stoch_k_arr = _to_float_array(stoch_k_values)
+    stoch_d_arr = _to_float_array(stoch_d_values)
+    
+    if len(rsi_arr) < 3 or len(macd_arr) < 3 or len(stoch_k_arr) < 1:
+        return result
+    
+    # Get config values
+    rsi_min = getattr(config, "EARLY_MOMENTUM_RSI_MIN", 38)
+    rsi_max = getattr(config, "EARLY_MOMENTUM_RSI_MAX", 48)
+    stoch_min = getattr(config, "EARLY_MOMENTUM_STOCH_MIN", 20)
+    
+    # Condition 1: RSI rising for 3 bars AND in recovery zone (38-48)
+    rsi_1 = rsi_arr[-1]
+    rsi_2 = rsi_arr[-2]
+    rsi_3 = rsi_arr[-3]
+    
+    if not (_is_valid(rsi_1) and _is_valid(rsi_2) and _is_valid(rsi_3)):
+        return result
+    
+    rsi_rising = rsi_1 > rsi_2 > rsi_3
+    rsi_in_zone = rsi_min <= rsi_1 <= rsi_max
+    
+    result["rsi_rising"] = rsi_rising
+    result["rsi_in_recovery_zone"] = rsi_in_zone
+    result["details"]["rsi_current"] = round(float(rsi_1), 1)
+    result["details"]["rsi_3bar_change"] = round(float(rsi_1 - rsi_3), 1)
+    
+    if rsi_rising and rsi_in_zone:
+        result["confidence"] += 1
+    
+    # Condition 2: MACD histogram turning up from negative
+    hist_1 = macd_arr[-1]
+    hist_2 = macd_arr[-2]
+    hist_3 = macd_arr[-3]
+    
+    if _is_valid(hist_1) and _is_valid(hist_2) and _is_valid(hist_3):
+        macd_turning = hist_3 < 0 and hist_2 < 0 and hist_1 > hist_2
+        result["macd_turning_up"] = macd_turning
+        result["details"]["macd_hist_current"] = round(float(hist_1), 6)
+        result["details"]["macd_hist_prev"] = round(float(hist_2), 6)
+        
+        if macd_turning:
+            result["confidence"] += 1
+    
+    # Condition 3: Stoch K bullish cross (K > D and K > 20)
+    k_1 = stoch_k_arr[-1]
+    d_1 = stoch_d_arr[-1] if len(stoch_d_arr) >= 1 and _is_valid(stoch_d_arr[-1]) else 50.0
+    
+    if _is_valid(k_1):
+        stoch_bullish = k_1 > d_1 and k_1 > stoch_min
+        result["stoch_bullish_cross"] = stoch_bullish
+        result["details"]["stoch_k"] = round(float(k_1), 1)
+        result["details"]["stoch_d"] = round(float(d_1), 1)
+        
+        if stoch_bullish:
+            result["confidence"] += 1
+    
+    # All 3 conditions = momentum shift detected
+    result["detected"] = result["confidence"] >= 3
+    
+    return result
+
+
+def detect_breakout(
+    closes: Sequence[float],
+    highs: Sequence[float],
+    volumes: Sequence[float],
+    ema20: float,
+    lookback: int = 20,
+) -> dict:
+    """
+    Detect resistance breakout - signals at the breakout moment, not after.
+    
+    Conditions (ALL must be true):
+    1. last_close > max(high[-lookback:-1]) — resistance broken
+    2. last_close > ema20 — short-term trend confirmed
+    3. volume[-1] >= 1.2 * avg(volume[-lookback:-1]) — volume confirmation
+    
+    Returns:
+        {
+            "detected": bool,
+            "breakout_level": float,
+            "breakout_pct": float,  # % above resistance
+            "volume_ratio": float,
+            "details": {...}
+        }
+    """
+    result = {
+        "detected": False,
+        "breakout_level": 0.0,
+        "breakout_pct": 0.0,
+        "volume_ratio": 0.0,
+        "details": {}
+    }
+    
+    closes_arr = _to_float_array(closes)
+    highs_arr = _to_float_array(highs)
+    volumes_arr = _to_float_array(volumes)
+    
+    if len(closes_arr) < lookback + 1 or len(highs_arr) < lookback + 1 or len(volumes_arr) < lookback + 1:
+        return result
+    
+    last_close = closes_arr[-1]
+    last_volume = volumes_arr[-1]
+    
+    if not _is_valid(last_close) or not _is_valid(last_volume):
+        return result
+    
+    # Get volume multiplier from config
+    vol_mult = getattr(config, "BREAKOUT_VOLUME_MULTIPLIER", 1.2)
+    
+    # Resistance level = max of previous highs (excluding current bar)
+    prev_highs = highs_arr[-lookback-1:-1]
+    valid_highs = prev_highs[~np.isnan(prev_highs)]
+    if len(valid_highs) == 0:
+        return result
+    
+    resistance = float(np.max(valid_highs))
+    result["breakout_level"] = resistance
+    result["details"]["resistance_20bar"] = round(resistance, 6)
+    
+    # Condition 1: Price broke resistance
+    broke_resistance = last_close > resistance
+    if broke_resistance:
+        result["breakout_pct"] = round((last_close - resistance) / resistance * 100, 2)
+    
+    # Condition 2: Price above EMA20
+    above_ema = last_close > ema20 if ema20 > 0 and _is_valid(ema20) else False
+    result["details"]["above_ema20"] = above_ema
+    result["details"]["ema20"] = round(ema20, 6) if _is_valid(ema20) else None
+    
+    # Condition 3: Volume confirmation
+    prev_volumes = volumes_arr[-lookback-1:-1]
+    valid_volumes = prev_volumes[~np.isnan(prev_volumes)]
+    avg_volume = float(np.mean(valid_volumes)) if len(valid_volumes) > 0 else 0
+    
+    volume_ratio = last_volume / avg_volume if avg_volume > 0 else 0.0
+    result["volume_ratio"] = round(volume_ratio, 2)
+    result["details"]["avg_volume_20bar"] = round(avg_volume, 2)
+    
+    volume_confirmed = volume_ratio >= vol_mult
+    result["details"]["volume_confirmed"] = volume_confirmed
+    
+    # All conditions met = breakout detected
+    result["detected"] = broke_resistance and above_ema and volume_confirmed
+    
+    return result
+
+
+def stochastic_d(k_values: Sequence[float], period: int = 3) -> List[float]:
+    """Calculate Stochastic %D (SMA of %K)."""
+    k_arr = _to_float_array(k_values)
+    length = len(k_arr)
+    result = [NAN] * length
+    
+    if period <= 0 or length < period:
+        return result
+    
+    for i in range(period - 1, length):
+        window = k_arr[i - period + 1 : i + 1]
+        valid = window[~np.isnan(window)]
+        if len(valid) == period:
+            result[i] = float(np.mean(valid))
+    
+    return result

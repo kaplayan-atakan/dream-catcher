@@ -297,6 +297,43 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
                 momentum_rev.get("confidence_score"),
             )
 
+        # === EARLY MOMENTUM DETECTION (V6) ===
+        early_momentum = {}
+        if getattr(config, "ENABLE_EARLY_MOMENTUM_DETECTION", False):
+            # Calculate Stochastic D for early momentum detection
+            stoch_d_values = indicators.stochastic_d(stoch_k_values, period=3)
+            
+            early_momentum = indicators.detect_early_momentum_shift(
+                rsi_values=rsi_values[-10:] if len(rsi_values) >= 10 else rsi_values,
+                macd_hist_values=macd_hist[-10:] if len(macd_hist) >= 10 else macd_hist,
+                stoch_k_values=stoch_k_values[-10:] if len(stoch_k_values) >= 10 else stoch_k_values,
+                stoch_d_values=stoch_d_values[-10:] if len(stoch_d_values) >= 10 else stoch_d_values,
+            )
+            if early_momentum.get("detected"):
+                logger.debug(
+                    "[%s] Early momentum shift detected (confidence: %s/3)",
+                    symbol,
+                    early_momentum.get("confidence"),
+                )
+
+        # === BREAKOUT DETECTION (V6) ===
+        breakout = {}
+        if getattr(config, "ENABLE_BREAKOUT_DETECTION", False):
+            breakout = indicators.detect_breakout(
+                closes=closes,
+                highs=highs,
+                volumes=volumes,
+                ema20=last_ema20 if last_ema20 is not None else 0,
+                lookback=getattr(config, "BREAKOUT_LOOKBACK_BARS", 20),
+            )
+            if breakout.get("detected"):
+                logger.debug(
+                    "[%s] Breakout detected (+%.1f%% above resistance, vol %.1fx)",
+                    symbol,
+                    breakout.get("breakout_pct", 0),
+                    breakout.get("volume_ratio", 0),
+                )
+
         # === BOTTOM-FISHING: Reversal candles (already in pa_signals) ===
         reversal_pa = price_action.detect_reversal_candles(opens, highs, lows, closes)
 
@@ -327,6 +364,19 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
             "low_15m": lows[-30:] if len(lows) >= 30 else list(lows),
             "volumes_15m": volumes[-30:] if len(volumes) >= 30 else list(volumes),
             "change_24h_pct": symbol_data.get("price_change_pct", 0.0),
+            # V6: Early momentum and breakout detection
+            "early_momentum": early_momentum,
+            "breakout": breakout,
+            # V6: Additional context for WATCH_PREMIUM early trigger
+            "macd_hist_rising": macd_hist_rising,
+            "stoch_rising": (
+                stoch_k_values[-1] > stoch_k_values[-2]
+                if len(stoch_k_values) >= 2
+                and stoch_k_values[-1] is not np.nan
+                and stoch_k_values[-2] is not np.nan
+                else False
+            ),
+            "ema20_slope_pct": htf_context.get("ema20_slope_pct", 0.0),
         }
 
         signal_result = rules.decide_signal_label(

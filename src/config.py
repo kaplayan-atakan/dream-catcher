@@ -39,6 +39,12 @@ MAX_24H_CHANGE = 20.0  # Reject symbols pumping beyond 20%
 COOLDOWN_MINUTES = 60
 MAX_SYMBOLS_PER_SCAN = 50  # Limit to top 50 by volume
 
+# === COOLDOWN SETTINGS ===
+# STRONG_BUY and ULTRA_BUY share COOLDOWN_MINUTES (above)
+# WATCH_PREMIUM has separate cooldown (does not affect STRONG/ULTRA)
+WATCH_PREMIUM_COOLDOWN_MINUTES = 30
+# DIP_COOLDOWN_MINUTES is defined in DIP_HUNTER section below
+
 # WATCH_PREMIUM controls
 # - ENABLE_WATCH_PREMIUM=False disables these informational alerts immediately
 # - Adjust WATCH_PREMIUM_MIN_SCORE to tune how many WATCH results get promoted
@@ -260,6 +266,29 @@ MACD_HIST_NEG_TO_POS_BARS = 3    # Lookback bars for histogram neg→pos turn
 
 # Momentum shift detection master toggle
 ENABLE_MOMENTUM_SHIFT_DETECTION = True
+
+# === EARLY MOMENTUM DETECTION (V6) ===
+# Detect momentum shift at the START of a move, not after
+ENABLE_EARLY_MOMENTUM_DETECTION = True
+EARLY_MOMENTUM_RSI_MIN = 38          # Lower bound of recovery zone
+EARLY_MOMENTUM_RSI_MAX = 48          # Upper bound of recovery zone
+EARLY_MOMENTUM_STOCH_MIN = 20        # Min Stoch K to confirm exit from oversold
+EARLY_MOMENTUM_BONUS = 3             # Bonus points when early momentum detected
+
+# === BREAKOUT DETECTION (V6) ===
+# Detect resistance breakout at the MOMENT it happens
+ENABLE_BREAKOUT_DETECTION = True
+BREAKOUT_LOOKBACK_BARS = 20          # Bars to look back for resistance
+BREAKOUT_VOLUME_MULTIPLIER = 1.2     # Min volume ratio for confirmation
+BREAKOUT_BONUS = 2                   # Bonus points for confirmed breakout
+
+# === WATCH_PREMIUM EARLY TRIGGER (V6) ===
+# New RSI range for WATCH_PREMIUM (earlier than before)
+WATCH_PREMIUM_RSI_MIN = 35           # Start watching from lower RSI
+WATCH_PREMIUM_RSI_MAX = 50           # Stop before overbought
+WATCH_PREMIUM_REQUIRE_MACD_RISING = True
+WATCH_PREMIUM_REQUIRE_STOCH_RISING = True
+WATCH_PREMIUM_REQUIRE_EMA_CURVING_UP = True
 
 # Backtest
 BACKTEST_TP_PERCENTS = [2.0, 3.0, 5.0, 10.0]

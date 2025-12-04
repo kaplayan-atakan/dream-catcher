@@ -681,10 +681,56 @@ def decide_signal_label(
                 reversal_bonus += 1
                 reversal_reasons.append("Near EMA20 support")
 
-    # Add reversal bonus to total score
-    score_total = score_core + htf_bonus + reversal_bonus
+    # === EARLY MOMENTUM BONUS (V6) ===
+    early_momentum_bonus = 0
+    early_momentum_reasons: List[str] = []
 
-    # Add reversal reasons to main reasons list
+    if getattr(config, "ENABLE_EARLY_MOMENTUM_DETECTION", False):
+        ctx = pre_signal_context or {}
+        momentum_data = ctx.get("early_momentum", {})
+        
+        if momentum_data.get("detected"):
+            early_momentum_bonus = getattr(config, "EARLY_MOMENTUM_BONUS", 3)
+            confidence = momentum_data.get("confidence", 0)
+            early_momentum_reasons.append(
+                f"🚀 Early momentum shift (confidence: {confidence}/3)"
+            )
+            
+            details = momentum_data.get("details", {})
+            if momentum_data.get("rsi_rising") and momentum_data.get("rsi_in_recovery_zone"):
+                rsi_val = details.get("rsi_current", 0)
+                early_momentum_reasons.append(f"RSI {rsi_val:.0f} rising from dip zone")
+            
+            if momentum_data.get("macd_turning_up"):
+                early_momentum_reasons.append("MACD histogram turning up from negative")
+            
+            if momentum_data.get("stoch_bullish_cross"):
+                early_momentum_reasons.append("Stoch K bullish cross above 20")
+
+    # === BREAKOUT BONUS (V6) ===
+    breakout_bonus = 0
+    breakout_reasons: List[str] = []
+
+    if getattr(config, "ENABLE_BREAKOUT_DETECTION", False):
+        ctx = pre_signal_context or {}
+        breakout_data = ctx.get("breakout", {})
+        
+        if breakout_data.get("detected"):
+            breakout_bonus = getattr(config, "BREAKOUT_BONUS", 2)
+            breakout_pct = breakout_data.get("breakout_pct", 0)
+            vol_ratio = breakout_data.get("volume_ratio", 0)
+            breakout_reasons.append(
+                f"💥 Breakout (+{breakout_pct:.1f}% above resistance, vol {vol_ratio:.1f}x)"
+            )
+
+    # Calculate total score for regular signals
+    # Includes early_momentum_bonus and breakout_bonus (V6)
+    # NO reversal_bonus - that's only for DIP_ALERT
+    score_total = score_core + htf_bonus + early_momentum_bonus + breakout_bonus
+
+    # Add bonus reasons to main reasons list
+    reasons.extend(early_momentum_reasons[:1])  # Limit to avoid clutter
+    reasons.extend(breakout_reasons[:1])
     reasons.extend(reversal_reasons[:2])  # Limit to avoid clutter
 
     # === DIP_HUNTER CHECK (V5) ===
@@ -749,6 +795,40 @@ def decide_signal_label(
         and htf_bonus >= config.HTF_MIN_FOR_ULTRA
     ):
         label = "ULTRA_BUY"
+
+    # === WATCH_PREMIUM EARLY TRIGGER (V6) ===
+    # Check if early conditions are met for WATCH_PREMIUM promotion
+    early_watch_met = False
+    if label == "WATCH" and score_core >= config.CORE_SCORE_WATCH_MIN:
+        ctx = pre_signal_context or {}
+        early_watch_conditions = 0
+        
+        # RSI in early zone (35-50 instead of 50-65)
+        wp_rsi_min = getattr(config, "WATCH_PREMIUM_RSI_MIN", 35)
+        wp_rsi_max = getattr(config, "WATCH_PREMIUM_RSI_MAX", 50)
+        if wp_rsi_min <= rsi_value <= wp_rsi_max:
+            early_watch_conditions += 1
+        
+        # MACD histogram rising
+        if getattr(config, "WATCH_PREMIUM_REQUIRE_MACD_RISING", True):
+            if ctx.get("macd_hist_rising", False):
+                early_watch_conditions += 1
+        
+        # Stoch rising
+        if getattr(config, "WATCH_PREMIUM_REQUIRE_STOCH_RISING", True):
+            if ctx.get("stoch_rising", False):
+                early_watch_conditions += 1
+        
+        # EMA20 curving up
+        if getattr(config, "WATCH_PREMIUM_REQUIRE_EMA_CURVING_UP", True):
+            ema_slope = ctx.get("ema20_slope_pct", 0)
+            if ema_slope > 0:
+                early_watch_conditions += 1
+        
+        # If 3+ conditions met, mark for WATCH_PREMIUM early trigger
+        if early_watch_conditions >= 3:
+            early_watch_met = True
+            reasons.append(f"Early WATCH conditions met ({early_watch_conditions}/4)")
 
     # === TOP FILTER: Downgrade overbought / late entries ===
     if getattr(config, "ENABLE_TOP_FILTER", False):

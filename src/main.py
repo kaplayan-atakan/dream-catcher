@@ -21,9 +21,90 @@ from signal_guard import SignalMonitor, SignalFailureEvent
 logger = log_module.setup_logger()
 
 # Global state
-last_signal_times: Dict[str, datetime] = {}
+last_signal_times: Dict[str, datetime] = {}  # Legacy - kept for backwards compatibility
 active_symbols: Set[str] = set()
 signal_monitor = SignalMonitor()
+
+# === SEPARATE COOLDOWN TRACKERS ===
+# Three independent cooldown dictionaries for signal isolation
+_cooldown_strong_ultra: Dict[str, datetime] = {}  # STRONG_BUY + ULTRA_BUY (shared)
+_cooldown_watch_premium: Dict[str, datetime] = {}  # WATCH_PREMIUM only
+_cooldown_dip_alert: Dict[str, datetime] = {}      # DIP_ALERT only (independent)
+
+
+def is_in_cooldown(symbol: str, signal_type: str) -> bool:
+    """
+    Check if symbol is in cooldown for given signal type.
+    
+    Cooldown rules:
+    - STRONG_BUY and ULTRA_BUY share cooldown
+    - WATCH_PREMIUM has separate cooldown (does not block STRONG/ULTRA)
+    - DIP_ALERT is completely independent (never blocked by others)
+    """
+    now = datetime.now()
+    
+    if signal_type == "DIP_ALERT":
+        # DIP_ALERT is completely independent
+        if symbol in _cooldown_dip_alert:
+            if now < _cooldown_dip_alert[symbol]:
+                return True
+        return False
+    
+    elif signal_type == "WATCH_PREMIUM":
+        # WATCH_PREMIUM has its own cooldown
+        if symbol in _cooldown_watch_premium:
+            if now < _cooldown_watch_premium[symbol]:
+                return True
+        return False
+    
+    elif signal_type in ("STRONG_BUY", "ULTRA_BUY"):
+        # STRONG and ULTRA share cooldown
+        if symbol in _cooldown_strong_ultra:
+            if now < _cooldown_strong_ultra[symbol]:
+                return True
+        return False
+    
+    return False
+
+
+def set_cooldown(symbol: str, signal_type: str) -> None:
+    """
+    Set cooldown for symbol after sending signal.
+    
+    Cooldown rules:
+    - STRONG_BUY/ULTRA_BUY: Sets shared cooldown, does NOT affect WATCH_PREMIUM or DIP
+    - WATCH_PREMIUM: Sets only WATCH_PREMIUM cooldown
+    - DIP_ALERT: Sets only DIP_ALERT cooldown
+    """
+    now = datetime.now()
+    
+    if signal_type == "DIP_ALERT":
+        # DIP_ALERT only sets its own cooldown
+        minutes = getattr(config, "DIP_COOLDOWN_MINUTES", 45)
+        _cooldown_dip_alert[symbol] = now + timedelta(minutes=minutes)
+        logger.debug(f"DIP_ALERT cooldown set for {symbol}: {minutes} min")
+    
+    elif signal_type == "WATCH_PREMIUM":
+        # WATCH_PREMIUM only sets its own cooldown
+        minutes = getattr(config, "WATCH_PREMIUM_COOLDOWN_MINUTES", 30)
+        _cooldown_watch_premium[symbol] = now + timedelta(minutes=minutes)
+        logger.debug(f"WATCH_PREMIUM cooldown set for {symbol}: {minutes} min")
+    
+    elif signal_type in ("STRONG_BUY", "ULTRA_BUY"):
+        # STRONG/ULTRA set shared cooldown only
+        minutes = getattr(config, "COOLDOWN_MINUTES", 60)
+        _cooldown_strong_ultra[symbol] = now + timedelta(minutes=minutes)
+        logger.debug(f"{signal_type} cooldown set for {symbol}: {minutes} min")
+
+
+def cleanup_expired_cooldowns() -> None:
+    """Remove expired cooldown entries to prevent memory bloat."""
+    now = datetime.now()
+    
+    for cooldown_dict in (_cooldown_strong_ultra, _cooldown_watch_premium, _cooldown_dip_alert):
+        expired = [sym for sym, exp_time in cooldown_dict.items() if now >= exp_time]
+        for sym in expired:
+            del cooldown_dict[sym]
 
 
 def _describe_failure_event(event: SignalFailureEvent) -> str:
@@ -189,7 +270,6 @@ async def scan_market(session: aiohttp.ClientSession) -> List[dict]:
             "volume": 0,
             "price": 0,
             "change": 0,
-            "cooldown": 0,
         }
         
         for ticker in tickers:
@@ -221,13 +301,8 @@ async def scan_market(session: aiohttp.ClientSession) -> List[dict]:
                     prefilter_stats["change"] += 1
                     continue
                 
-                # PREFILTER 4: Skip if in cooldown
-                if symbol in last_signal_times:
-                    time_since_signal = datetime.now() - last_signal_times[symbol]
-                    if time_since_signal < timedelta(minutes=config.COOLDOWN_MINUTES):
-                        logger.debug(f"Skipping {symbol} - in cooldown ({time_since_signal.seconds//60} min)")
-                        prefilter_stats["cooldown"] += 1
-                        continue
+                # NOTE: Cooldown is now checked per-signal-type AFTER analysis
+                # This allows a symbol to generate DIP_ALERT even if STRONG_BUY is in cooldown
                 
                 filtered_symbols.append(parsed)
                 
@@ -236,12 +311,11 @@ async def scan_market(session: aiohttp.ClientSession) -> List[dict]:
                 continue
         
         logger.info(
-            "Prefilter summary - kept: %d | volume: %d | price: %d | change: %d | cooldown: %d | non-USDT: %d",
+            "Prefilter summary - kept: %d | volume: %d | price: %d | change: %d | non-USDT: %d",
             len(filtered_symbols),
             prefilter_stats["volume"],
             prefilter_stats["price"],
             prefilter_stats["change"],
-            prefilter_stats["cooldown"],
             prefilter_stats["non_usdt"],
         )
         _log_prefilter_density(len(tickers), len(filtered_symbols))
@@ -390,26 +464,56 @@ async def main_loop():
                                 score_total_float = None
                             original_label = label
 
-                            # Cooldown is applied only to actionable signals.
-                            # WATCH should not block the symbol from generating future STRONG/ULTRA.
-                            if original_label in {"STRONG_BUY", "ULTRA_BUY"}:
-                                last_signal_times[symbol] = datetime.now()
+                            # === DETERMINE SIGNAL TYPE FOR COOLDOWN ===
+                            signal_type = None
+                            should_notify = False
+                            
+                            if original_label == "DIP_ALERT":
+                                signal_type = "DIP_ALERT"
+                                should_notify = True
+                            elif original_label == "ULTRA_BUY":
+                                signal_type = "ULTRA_BUY"
+                                should_notify = True
+                            elif original_label == "STRONG_BUY":
+                                signal_type = "STRONG_BUY"
+                                should_notify = True
+                            elif original_label == "WATCH" and score_total_float is not None and score_total_float >= config.WATCH_PREMIUM_MIN_SCORE:
+                                signal_type = "WATCH_PREMIUM"
+                                should_notify = getattr(config, "ENABLE_WATCH_PREMIUM", True)
 
+                            # === CHECK COOLDOWN FOR THIS SIGNAL TYPE ===
+                            if signal_type and is_in_cooldown(symbol, signal_type):
+                                logger.debug(f"{signal_type} for {symbol} skipped (cooldown)")
+                                # Still log to CSV for analysis, but don't notify
+                                log_module.log_signal_to_csv(
+                                    path=config.LOG_CSV_PATH,
+                                    signal=signal,
+                                    extra_fields={
+                                        'price': signal.get('price'),
+                                        'change_24h': signal.get('price_change_pct'),
+                                        'quote_vol_24h': signal.get('quote_volume'),
+                                        'cooldown_skipped': True,
+                                    }
+                                )
+                                continue  # Skip to next signal
+
+                            # === SIGNAL GUARD BLOCKING (for STRONG/ULTRA only) ===
                             blocked_reason = None
                             if original_label in {"STRONG_BUY", "ULTRA_BUY"} and signal_monitor.is_symbol_blocked(symbol):
                                 blocked_reason = signal_monitor.get_block_reason(symbol) or "Post-signal block active"
                                 label = "WATCH"
                                 signal['label'] = label
                                 logger.info("Blocking STRONG/ULTRA for %s due to %s", symbol, blocked_reason)
+                                # Re-evaluate as WATCH_PREMIUM
+                                if score_total_float is not None and score_total_float >= config.WATCH_PREMIUM_MIN_SCORE:
+                                    signal_type = "WATCH_PREMIUM"
+                                    should_notify = getattr(config, "ENABLE_WATCH_PREMIUM", True)
+                                else:
+                                    signal_type = None
+                                    should_notify = False
 
                             should_notify_strong = label in {"STRONG_BUY", "ULTRA_BUY"}
                             should_register = should_notify_strong
-                            should_notify_watch_premium = (
-                                original_label == "WATCH"
-                                and score_total_float is not None
-                                and config.ENABLE_WATCH_PREMIUM
-                                and score_total_float >= config.WATCH_PREMIUM_MIN_SCORE
-                            )
                             
                             # Log to CSV
                             log_module.log_signal_to_csv(
@@ -422,12 +526,22 @@ async def main_loop():
                                 }
                             )
                             
-                            # Send to Telegram
-                            if config.ENABLE_TELEGRAM and not in_warmup:
-                                if should_notify_strong:
+                            # === SEND TO TELEGRAM WITH SIGNAL-TYPE SPECIFIC COOLDOWN ===
+                            if config.ENABLE_TELEGRAM and not in_warmup and should_notify and signal_type:
+                                if signal_type == "DIP_ALERT":
+                                    message = telegram_bot.format_signal_message(
+                                        signal,
+                                        display_label="🎯 DIP_ALERT",
+                                        info_note="Dip bounce opportunity — momentum reversal expected.",
+                                    )
+                                    await telegram_bot.send_telegram_message(message)
+                                    set_cooldown(symbol, signal_type)
+                                    logger.info("DIP_ALERT sent for %s", symbol)
+                                elif signal_type in ("STRONG_BUY", "ULTRA_BUY"):
                                     message = telegram_bot.format_signal_message(signal)
                                     await telegram_bot.send_telegram_message(message)
-                                elif should_notify_watch_premium:
+                                    set_cooldown(symbol, signal_type)
+                                elif signal_type == "WATCH_PREMIUM":
                                     info_note = "Early alert only — not actionable. STRONG/ULTRA rules unchanged."
                                     message = telegram_bot.format_signal_message(
                                         signal,
@@ -435,17 +549,21 @@ async def main_loop():
                                         info_note=info_note,
                                     )
                                     await telegram_bot.send_telegram_message(message)
+                                    set_cooldown(symbol, signal_type)
                                     watch_premium_sent += 1
                                     log_score = score_total_float if score_total_float is not None else score_total_value
                                     logger.info("WATCH_PREMIUM sent for %s score=%s", symbol, log_score)
                             
                             # Console output
+                            display_label = signal_type if signal_type else label
                             label_emoji = {
                                 "ULTRA_BUY": "🚀",
                                 "STRONG_BUY": "📈",
+                                "WATCH_PREMIUM": "💎",
+                                "DIP_ALERT": "🎯",
                                 "WATCH": "👀",
-                            }.get(label, "ℹ️")
-                            logger.info(f"{label_emoji} {label}: {symbol}")
+                            }.get(display_label, "ℹ️")
+                            logger.info(f"{label_emoji} {display_label}: {symbol}")
                             core_score = signal.get('score_core', signal.get('total_score', 0))
                             htf_bonus = signal.get('htf_bonus', 0)
                             total_score = signal.get('score_total', signal.get('total_score', 0))
@@ -484,14 +602,8 @@ async def main_loop():
                 logger.info(f"Total signals generated: {total_signals}")
                 logger.info(f"Watch premium alerts sent: {watch_premium_sent}")
                 
-                # Clean up old cooldowns
-                current_time = datetime.now()
-                expired_symbols = [
-                    symbol for symbol, signal_time in last_signal_times.items()
-                    if current_time - signal_time > timedelta(minutes=config.COOLDOWN_MINUTES * 2)
-                ]
-                for symbol in expired_symbols:
-                    del last_signal_times[symbol]
+                # Clean up expired cooldowns from all three dictionaries
+                cleanup_expired_cooldowns()
                 
                 # Wait before next scan
                 logger.info(f"⏰ Waiting 60 seconds before next scan...")
