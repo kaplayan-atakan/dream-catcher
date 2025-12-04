@@ -45,7 +45,7 @@ MAX_SYMBOLS_PER_SCAN = 50  # Limit to top 50 by volume
 # - The label used in Telegram is WATCH_PREMIUM_TG_LABEL and the log line "WATCH_PREMIUM sent…".
 # - Verify by sending a WATCH with score>=WATCH_PREMIUM_MIN_SCORE and watching for the INFO line + Telegram payload.
 ENABLE_WATCH_PREMIUM = True  # Toggle informational WATCH alerts (no post-signal effects)
-WATCH_PREMIUM_MIN_SCORE = 18
+WATCH_PREMIUM_MIN_SCORE = 18  # v4.2: higher threshold for quality (v1=18, v3=17)
 WATCH_PREMIUM_TG_LABEL = "WATCH_PREMIUM"
 
 # Pre-signal gating filters
@@ -65,11 +65,32 @@ EXHAUSTION_LOOKBACK = 8
 LATE_PUMP_EMA_DIST_PCT = 3.0
 LATE_PUMP_RUNUP_PCT = 8.0
 
+# === PARABOLIC EXTENSION FILTER (Blow-off Top Guard #1) ===
+# Detects when price runs too far from EMA20 in a parabolic move (consecutive rising bars)
+ENABLE_PARABOLIC_EXTENSION_FILTER = True
+PARABOLIC_EMA_DIST_PCT = 5.0       # Price >= EMA20 + 5% triggers check
+PARABOLIC_RUN_PCT = 4.0            # Last N bars total gain >= 4%
+PARABOLIC_CONSECUTIVE_BARS = 5     # How many consecutive rising bars to check
+PARABOLIC_24H_MIN_PCT = 8.0        # 24h change must be >= this to trigger
+
+# === BLOW-OFF CANDLE FILTER (Blow-off Top Guard #2) ===
+# Detects single exhaustion spike candle (huge range, close at top, abnormal volume)
+ENABLE_BLOWOFF_CANDLE_FILTER = True
+BLOWOFF_RANGE_MULTIPLIER = 2.5     # Candle range >= 2.5x median range
+BLOWOFF_UPPER_WICK_MAX_PCT = 0.20  # Close near high (upper wick <= 20% of range)
+BLOWOFF_VOLUME_MULTIPLIER = 3.0    # Volume >= 3x average volume
+BLOWOFF_LOOKBACK = 20              # Bars for median/average calculation
+
+# === LATE PUMP HARD STOP (Blow-off Top Guard #3) ===
+# Block STRONG/ULTRA entirely when 24h change is extremely high
+ENABLE_LATE_PUMP_HARD_STOP = True
+LATE_PUMP_24H_THRESHOLD = 15.0     # 24h change >= 15% blocks actionable signals
+
 # === TREND REVERSAL SAFEGUARDS (Revizyon 2) ===
 ENABLE_CANDLE_DIRECTION_FILTER = True
 ENABLE_MOMENTUM_TURNING_FILTER = True
 ENABLE_LOCAL_BOTTOM_FILTER = True
-LOCAL_BOTTOM_LOOKBACK = 6
+LOCAL_BOTTOM_LOOKBACK = 5  # Lowered from 6 for more reactive bottom detection
 
 # Post-signal validation
 FOLLOW_THROUGH_TARGET_MULTIPLIER = 1.008  # Require +0.8% within validation window
@@ -186,8 +207,8 @@ VOL_MIN_FOR_ULTRA = 3
 HTF_MIN_FOR_ULTRA = 2
 
 # Oscillator / momentum guardrails
-RSI_STRONG_MIN = 50
-RSI_STRONG_MAX = 65
+RSI_STRONG_MIN = 50  # v4.1: skip recovery zone (35-45) which has 27% win rate
+RSI_STRONG_MAX = 62  # v5-final: tightened from 65 to improve STRONG/ULTRA win rates
 RSI_BUFFER_MIN = 45
 RSI_BUFFER_MAX = 70
 STOCH_K_MIDLINE = 50
@@ -199,8 +220,8 @@ UO_RISING_MIN_DELTA = 0.5
 ENABLE_BOTTOM_FISHING = True  # Master toggle for dip-focused logic
 
 # RSI dip zone
-RSI_OVERSOLD_ZONE = 35        # r < 35 considered oversold
-RSI_RECOVERY_MIN = 38         # Early recovery level from oversold
+RSI_OVERSOLD_ZONE = 30        # v4: focus on true oversold (<35) which has 31.9% win rate
+RSI_RECOVERY_MIN = 36         # v3: balanced (v1=38, v2=35) - aligned with RSI_STRONG_MIN
 RSI_OVERSOLD_EXIT = 40        # Full exit from oversold
 
 # Stochastic recovery
@@ -232,7 +253,7 @@ RSI_RECOVERY_BONUS = 2           # Bonus for RSI exiting oversold
 
 # Top filter (avoid late entries)
 ENABLE_TOP_FILTER = True         # Downgrade signals at overbought tops
-RSI_TOP_THRESHOLD = 70           # RSI above this = momentum exhausted
+RSI_TOP_THRESHOLD = 75           # v4: allow more overbought (30.7% win rate at 65+)
 
 # MACD histogram turning detection
 MACD_HIST_NEG_TO_POS_BARS = 3    # Lookback bars for histogram neg→pos turn
@@ -245,6 +266,28 @@ BACKTEST_TP_PERCENTS = [2.0, 3.0, 5.0, 10.0]
 BACKTEST_SL_PERCENTS = [1.0, 2.0, 3.0]
 BACKTEST_LOOKAHEAD_BARS = 96
 
+# === DIP HUNTER MODE (V5) ===
+# Targets high-performance zone combination: RSI oversold + EMA below + 24h dump
+# Cross-zone analysis shows 68.8% win rate for this combination
+ENABLE_DIP_HUNTER = True
+
+# DIP_HUNTER Entry Conditions (all must be true)
+DIP_RSI_MAX = 35                    # RSI must be below this (oversold)
+DIP_EMA_ZONE = "below"              # Price must be below EMA20
+DIP_EMA_DIST_MIN_PCT = -1.0         # At least 1% below EMA20
+DIP_24H_CHANGE_MAX = -5.0           # 24h change must be negative (dump)
+
+# DIP_HUNTER Signal Settings
+DIP_MIN_SCORE = 6                   # Lower score threshold for dip signals
+DIP_SIGNAL_LABEL = "DIP_ALERT"      # Label for dip signals
+DIP_NOTIFY_TELEGRAM = True          # Send to Telegram
+DIP_COOLDOWN_MINUTES = 45           # Separate cooldown for dip signals
+
+# DIP_HUNTER Bonus Scoring
+DIP_OVERSOLD_BONUS = 3              # Bonus when RSI < 30
+DIP_DEEP_DUMP_BONUS = 2             # Bonus when 24h < -8%
+DIP_EMA_FAR_BELOW_BONUS = 2         # Bonus when price > 3% below EMA
+
 # === PREFILTER RELAXATION (when bottom-fishing is enabled) ===
 # These overrides allow catching dip reversals that would otherwise be filtered out
 if ENABLE_BOTTOM_FISHING:
@@ -252,6 +295,6 @@ if ENABLE_BOTTOM_FISHING:
     MAX_SYMBOLS_PER_SCAN = 100          # Increased from 50
     COOLDOWN_MINUTES = 30               # Reduced from 60
     MAX_24H_CHANGE = 8.0                # Reduced from 20%
-    MIN_24H_CHANGE = -5.0               # Relaxed from -10%
-    RSI_STRONG_MIN = 38                 # Lowered from 50 for earlier entries
-    RSI_STRONG_MAX = 55                 # Lowered from 65 to avoid late entries
+    MIN_24H_CHANGE = -8.0               # v4.1: allow deeper dips (dump zone has 45% win rate)
+    RSI_STRONG_MIN = 50                 # v4.1: skip recovery zone (35-45) - 27% win rate trap
+    RSI_STRONG_MAX = 62                 # v5-final: tightened from 65 to improve quality

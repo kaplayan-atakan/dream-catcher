@@ -321,6 +321,12 @@ async def analyze_symbol(session, symbol_data: dict) -> Optional[dict]:
             "momentum_rev": momentum_rev,
             "reversal_pa": reversal_pa,
             "support_data": support_data,
+            # Extended OHLCV arrays for blow-off / parabolic filters
+            "opens_15m": opens[-30:] if len(opens) >= 30 else list(opens),
+            "high_15m": highs[-30:] if len(highs) >= 30 else list(highs),
+            "low_15m": lows[-30:] if len(lows) >= 30 else list(lows),
+            "volumes_15m": volumes[-30:] if len(volumes) >= 30 else list(volumes),
+            "change_24h_pct": symbol_data.get("price_change_pct", 0.0),
         }
 
         signal_result = rules.decide_signal_label(

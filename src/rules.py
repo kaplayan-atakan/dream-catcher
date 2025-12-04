@@ -1,6 +1,8 @@
 """Rule-based scoring aligned with the revised Phase 3 spec."""
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
+
+import numpy as np
 
 import config
 
@@ -14,6 +16,134 @@ def _ema_similarity(ema_fast: Optional[float], ema_slow: Optional[float]) -> boo
         return False
     diff_ratio = abs(ema_fast - ema_slow) / max(abs(ema_slow), 1e-8)
     return diff_ratio <= config.EMA_SIMILARITY_TOLERANCE
+
+
+# === ZONE CLASSIFICATION HELPERS (V5) ===
+def get_rsi_zone(rsi: float) -> str:
+    """Classify RSI into zones."""
+    if rsi < 30:
+        return "deep_oversold"
+    elif rsi < 35:
+        return "oversold"
+    elif rsi < 45:
+        return "recovery"
+    elif rsi < 55:
+        return "neutral"
+    elif rsi < 65:
+        return "strong"
+    else:
+        return "overbought"
+
+
+def get_ema_zone(price: float, ema20: Optional[float]) -> Tuple[str, float]:
+    """Classify EMA distance into zones. Returns (zone, distance_pct)."""
+    if ema20 is None or ema20 <= 0:
+        return "unknown", 0.0
+    
+    dist_pct = (price - ema20) / ema20 * 100
+    
+    if dist_pct < -3.0:
+        return "far_below", dist_pct
+    elif dist_pct < -1.0:
+        return "below", dist_pct
+    elif dist_pct <= 1.0:
+        return "near", dist_pct
+    elif dist_pct <= 3.0:
+        return "above", dist_pct
+    else:
+        return "far_above", dist_pct
+
+
+def get_24h_zone(change_pct: float) -> str:
+    """Classify 24h change into zones."""
+    if change_pct < -5.0:
+        return "dump"
+    elif change_pct < -2.0:
+        return "down"
+    elif change_pct <= 2.0:
+        return "flat"
+    elif change_pct <= 5.0:
+        return "up"
+    else:
+        return "pump"
+
+
+def check_dip_hunter_signal(
+    rsi_value: float,
+    price: float,
+    ema20: Optional[float],
+    change_24h_pct: float,
+    base_score: int,
+) -> Tuple[bool, str, int, List[str]]:
+    """
+    Check if conditions match DIP_HUNTER mode.
+    
+    Returns:
+        (is_dip_signal, label, adjusted_score, reasons)
+    """
+    if not getattr(config, "ENABLE_DIP_HUNTER", False):
+        return False, "", 0, []
+    
+    reasons = []
+    bonus = 0
+    
+    # Get zones
+    rsi_zone = get_rsi_zone(rsi_value)
+    ema_zone, ema_dist = get_ema_zone(price, ema20)
+    change_zone = get_24h_zone(change_24h_pct)
+    
+    # Check DIP_HUNTER conditions
+    # 1. RSI must be oversold
+    dip_rsi_max = getattr(config, "DIP_RSI_MAX", 35)
+    if rsi_value > dip_rsi_max:
+        return False, "", 0, []
+    
+    # 2. Price must be below EMA20
+    if ema_zone not in ("below", "far_below"):
+        return False, "", 0, []
+    
+    dip_ema_dist_min = getattr(config, "DIP_EMA_DIST_MIN_PCT", -1.0)
+    if ema_dist > dip_ema_dist_min:
+        return False, "", 0, []
+    
+    # 3. 24h change must be dump
+    dip_24h_max = getattr(config, "DIP_24H_CHANGE_MAX", -5.0)
+    if change_24h_pct > dip_24h_max:
+        return False, "", 0, []
+    
+    # All conditions met - this is a DIP signal
+    reasons.append(f"🎯 DIP_HUNTER: RSI={rsi_value:.0f} ({rsi_zone})")
+    reasons.append(f"📉 EMA20 distance: {ema_dist:.1f}% ({ema_zone})")
+    reasons.append(f"📊 24h change: {change_24h_pct:.1f}% ({change_zone})")
+    
+    # Apply bonuses
+    dip_oversold_bonus = getattr(config, "DIP_OVERSOLD_BONUS", 3)
+    dip_deep_dump_bonus = getattr(config, "DIP_DEEP_DUMP_BONUS", 2)
+    dip_ema_far_below_bonus = getattr(config, "DIP_EMA_FAR_BELOW_BONUS", 2)
+    
+    if rsi_value < 30:
+        bonus += dip_oversold_bonus
+        reasons.append(f"🔥 Deep oversold bonus +{dip_oversold_bonus}")
+    
+    if change_24h_pct < -8.0:
+        bonus += dip_deep_dump_bonus
+        reasons.append(f"🔥 Deep dump bonus +{dip_deep_dump_bonus}")
+    
+    if ema_dist < -3.0:
+        bonus += dip_ema_far_below_bonus
+        reasons.append(f"🔥 Far below EMA bonus +{dip_ema_far_below_bonus}")
+    
+    # Calculate final score
+    final_score = base_score + bonus
+    
+    # Check minimum score
+    dip_min_score = getattr(config, "DIP_MIN_SCORE", 6)
+    if final_score < dip_min_score:
+        return False, "", 0, []
+    
+    label = getattr(config, "DIP_SIGNAL_LABEL", "DIP_ALERT")
+    
+    return True, label, final_score, reasons
 
 @dataclass
 class BlockScore:
@@ -323,6 +453,149 @@ def detect_risk(
     return "NORMAL"
 
 
+# ============ BLOW-OFF TOP GUARD FUNCTIONS ============
+
+def is_parabolic_extension(context: Dict[str, Any]) -> tuple[bool, str]:
+    """
+    Parabolic Extension Filter (Blow-off Top Guard #1)
+    
+    Detects when price has run too far from EMA20 in a parabolic move.
+    Conditions:
+    - Price >= EMA20 + PARABOLIC_EMA_DIST_PCT
+    - Last N closes are ALL rising consecutively
+    - Total run of last N bars >= PARABOLIC_RUN_PCT
+    - 24h change >= PARABOLIC_24H_MIN_PCT
+    """
+    if not getattr(config, "ENABLE_PARABOLIC_EXTENSION_FILTER", False):
+        return False, ""
+
+    close = context.get("last_close")
+    ema20 = context.get("ema20_15m")
+    closes = context.get("recent_closes_15m") or []
+    change_24h = context.get("change_24h_pct", 0.0)
+
+    if close is None or ema20 is None or ema20 <= 0:
+        return False, ""
+
+    n_bars = getattr(config, "PARABOLIC_CONSECUTIVE_BARS", 5)
+    if len(closes) < n_bars:
+        return False, ""
+
+    # Check distance from EMA20
+    pct_from_ema = (close - ema20) / ema20 * 100.0
+    if pct_from_ema < getattr(config, "PARABOLIC_EMA_DIST_PCT", 5.0):
+        return False, ""
+
+    # Check consecutive rising closes
+    recent = closes[-n_bars:]
+    all_rising = all(recent[i] > recent[i - 1] for i in range(1, len(recent)))
+    if not all_rising:
+        return False, ""
+
+    # Check total run percentage
+    total_run = (recent[-1] - recent[0]) / recent[0] * 100.0 if recent[0] > 0 else 0.0
+    if total_run < getattr(config, "PARABOLIC_RUN_PCT", 4.0):
+        return False, ""
+
+    # Check 24h change threshold
+    if change_24h < getattr(config, "PARABOLIC_24H_MIN_PCT", 8.0):
+        return False, ""
+
+    note = f"Filter: Parabolic extension (+{pct_from_ema:.1f}% from EMA20, {n_bars} rising bars, +{total_run:.1f}% run)"
+    return True, note
+
+
+def is_blowoff_candle(context: Dict[str, Any]) -> tuple[bool, str]:
+    """
+    Blow-off Candle Filter (Blow-off Top Guard #2)
+    
+    Detects a single exhaustion spike candle.
+    Conditions:
+    - Candle range >= BLOWOFF_RANGE_MULTIPLIER × median range
+    - Close near high (upper wick <= BLOWOFF_UPPER_WICK_MAX_PCT of range)
+    - Candle is green (close > open)
+    - Volume >= BLOWOFF_VOLUME_MULTIPLIER × avg volume
+    """
+    if not getattr(config, "ENABLE_BLOWOFF_CANDLE_FILTER", False):
+        return False, ""
+
+    highs = context.get("high_15m") or []
+    lows = context.get("low_15m") or []
+    closes = context.get("recent_closes_15m") or []
+    opens = context.get("opens_15m") or []
+    volumes = context.get("volumes_15m") or []
+
+    lb = getattr(config, "BLOWOFF_LOOKBACK", 20)
+    if len(highs) < lb or len(lows) < lb or len(volumes) < lb or len(opens) < 1 or len(closes) < 1:
+        return False, ""
+
+    h = highs[-1]
+    l = lows[-1]
+    c = closes[-1]
+    o = opens[-1]
+    v = volumes[-1]
+
+    rng = h - l
+    if rng <= 0:
+        return False, ""
+
+    # Median range of last N bars
+    ranges = [highs[-(i+1)] - lows[-(i+1)] for i in range(min(lb, len(highs)))]
+    if not ranges:
+        return False, ""
+    median_rng = float(np.median(ranges))
+    if median_rng <= 0:
+        return False, ""
+
+    range_mult = getattr(config, "BLOWOFF_RANGE_MULTIPLIER", 2.5)
+    if rng < range_mult * median_rng:
+        return False, ""
+
+    # Close near the high (small upper wick)
+    upper_wick_ratio = (h - c) / rng
+    wick_max = getattr(config, "BLOWOFF_UPPER_WICK_MAX_PCT", 0.20)
+    if upper_wick_ratio > wick_max:
+        return False, ""
+
+    # Must be green candle
+    if c <= o:
+        return False, ""
+
+    # Volume spike check
+    avg_vol = sum(volumes[-lb:]) / lb if len(volumes) >= lb else sum(volumes) / max(len(volumes), 1)
+    vol_mult = getattr(config, "BLOWOFF_VOLUME_MULTIPLIER", 3.0)
+    if avg_vol <= 0 or v < vol_mult * avg_vol:
+        return False, ""
+
+    range_factor = rng / median_rng
+    vol_factor = v / avg_vol if avg_vol > 0 else 0
+    note = f"Filter: Blow-off top candle (range {range_factor:.1f}x median, volume {vol_factor:.1f}x avg)"
+    return True, note
+
+
+def apply_late_pump_hard_stop(label: str, context: Dict[str, Any], notes: List[str]) -> str:
+    """
+    Late Pump Hard Stop (Blow-off Top Guard #3)
+    
+    If 24h change >= LATE_PUMP_24H_THRESHOLD, block STRONG/ULTRA entirely.
+    The move is likely exhausted at this point.
+    """
+    if not getattr(config, "ENABLE_LATE_PUMP_HARD_STOP", False):
+        return label
+
+    if label not in {"STRONG_BUY", "ULTRA_BUY"}:
+        return label
+
+    change_24h = context.get("change_24h_pct", 0.0)
+    threshold = getattr(config, "LATE_PUMP_24H_THRESHOLD", 15.0)
+
+    if change_24h >= threshold:
+        notes.append(f"Filter: Late pump hard stop (24h +{change_24h:.1f}% >= {threshold}%)")
+        return "WATCH"
+
+    return label
+
+
 def decide_signal_label(
     trend_block: BlockScore,
     osc_block: BlockScore,
@@ -413,6 +686,49 @@ def decide_signal_label(
 
     # Add reversal reasons to main reasons list
     reasons.extend(reversal_reasons[:2])  # Limit to avoid clutter
+
+    # === DIP_HUNTER CHECK (V5) ===
+    # Check before regular label logic - DIP signals bypass normal RSI filters
+    if getattr(config, "ENABLE_DIP_HUNTER", False):
+        ctx = pre_signal_context or {}
+        price = ctx.get("last_close", 0)
+        ema20 = ctx.get("ema20_15m", 0)
+        change_24h = ctx.get("change_24h_pct", 0)
+        
+        is_dip, dip_label, dip_score, dip_reasons = check_dip_hunter_signal(
+            rsi_value=rsi_value,
+            price=price,
+            ema20=ema20,
+            change_24h_pct=change_24h,
+            base_score=score_core,
+        )
+        
+        if is_dip:
+            reasons.extend(dip_reasons)
+            filter_notes: List[str] = []
+            return SignalResult(
+                symbol=symbol,
+                trend_score=trend_component,
+                osc_score=osc_component,
+                vol_score=vol_component,
+                pa_score=pa_component,
+                htf_bonus=htf_bonus,
+                score_core=score_core,
+                score_total=dip_score,
+                label=dip_label,
+                reasons=reasons[:7],  # Allow more reasons for DIP
+                rsi=rsi_value,
+                price=meta.get("price") if meta else 0.0,
+                price_change_pct=meta.get("price_change_pct") if meta else 0.0,
+                quote_volume=meta.get("quote_volume") if meta else 0.0,
+                risk_tag="DIP_HUNTER",
+                trend_details=trend_block.details,
+                osc_details=osc_block.details,
+                vol_details=vol_block.details,
+                pa_details=pa_block.details,
+                htf_details=htf_block.details if htf_block else None,
+                filter_notes=filter_notes,
+            )
 
     label = "NO_SIGNAL"
     if score_core < config.CORE_SCORE_WATCH_MIN:
@@ -514,6 +830,25 @@ def _apply_pre_signal_filters(
                 notes.append("Filter: SSR blocked because price is below EMA20 on 15m")
                 downgraded = "WATCH" if score_core >= config.CORE_SCORE_WATCH_MIN else "NO_SIGNAL"
                 return downgraded, notes
+
+    # === BLOW-OFF TOP GUARD #1: PARABOLIC EXTENSION FILTER ===
+    is_parabolic, parabolic_note = is_parabolic_extension(context)
+    if is_parabolic:
+        notes.append(parabolic_note)
+        downgraded = "WATCH" if score_core >= config.CORE_SCORE_WATCH_MIN else "NO_SIGNAL"
+        return downgraded, notes
+
+    # === BLOW-OFF TOP GUARD #2: BLOW-OFF CANDLE FILTER ===
+    is_blowoff, blowoff_note = is_blowoff_candle(context)
+    if is_blowoff:
+        notes.append(blowoff_note)
+        downgraded = "WATCH" if score_core >= config.CORE_SCORE_WATCH_MIN else "NO_SIGNAL"
+        return downgraded, notes
+
+    # === BLOW-OFF TOP GUARD #3: LATE PUMP HARD STOP ===
+    label = apply_late_pump_hard_stop(label, context, notes)
+    if label == "WATCH":
+        return label, notes
 
     # === EXISTING PRE-SIGNAL FILTERS ===
     ma60 = context.get("ma60")
