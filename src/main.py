@@ -48,7 +48,8 @@ async def _handle_post_signal_failures(events: List[SignalFailureEvent], in_warm
         logger.warning(message)
         if config.ENABLE_TELEGRAM and not in_warmup:
             try:
-                await telegram_bot.send_telegram_message(message)
+                # Use send_simple_message for plain text failure alerts (no Markdown)
+                await telegram_bot.send_simple_message(message)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to send Telegram failure alert for %s: %s", event.symbol, exc)
 

@@ -455,7 +455,7 @@ def detect_risk(
 
 # ============ BLOW-OFF TOP GUARD FUNCTIONS ============
 
-def is_parabolic_extension(context: Dict[str, Any]) -> tuple[bool, str]:
+def is_parabolic_extension(context: Dict[str, Any]) -> Tuple[bool, str]:
     """
     Parabolic Extension Filter (Blow-off Top Guard #1)
     
@@ -505,7 +505,7 @@ def is_parabolic_extension(context: Dict[str, Any]) -> tuple[bool, str]:
     return True, note
 
 
-def is_blowoff_candle(context: Dict[str, Any]) -> tuple[bool, str]:
+def is_blowoff_candle(context: Dict[str, Any]) -> Tuple[bool, str]:
     """
     Blow-off Candle Filter (Blow-off Top Guard #2)
     
