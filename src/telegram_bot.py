@@ -30,12 +30,17 @@ def _escape_markdown(text: str) -> str:
     return text
 
 
-def format_signal_message(signal: Dict[str, object]) -> str:
-    """Return a beautifully formatted signal message with dynamic styling based on signal type."""
+def format_signal_message(
+    signal: Dict[str, object],
+    display_label: str | None = None,
+    info_note: str | None = None,
+) -> str:
+    """Return a beautifully formatted signal message with optional display label overrides."""
     price = signal.get("price")
     change = signal.get("price_change_pct")
     quote_vol = signal.get("quote_volume")
-    label = signal.get("label", "NO_SIGNAL")
+    original_label = signal.get("label", "NO_SIGNAL")
+    label = display_label or original_label
     symbol = signal.get("symbol", "UNKNOWN")
     
     # Get scores
@@ -65,6 +70,10 @@ def format_signal_message(signal: Dict[str, object]) -> str:
         header_emoji = "📈💎"
         divider = "━━━━━━━━━━━━━━━━━━━━"
         signal_type = "*STRONG BUY*"
+    elif label == config.WATCH_PREMIUM_TG_LABEL:
+        header_emoji = "🔔🌟"
+        divider = "━━━━━━━━━━━━━━━━━━━━"
+        signal_type = "*WATCH_PREMIUM*"
     else:  # WATCH
         header_emoji = "👀📊"
         divider = "━━━━━━━━━━━━━━━━━━━━"
@@ -110,6 +119,15 @@ def format_signal_message(signal: Dict[str, object]) -> str:
     lines.append(f"HTF Bonus: \\+{htf_bonus}")
     lines.append(f"*TOTAL: {total_score}* 🎯")
     lines.append(divider)
+    if label == config.WATCH_PREMIUM_TG_LABEL or info_note:
+        detail_score = total_score if total_score is not None else 0
+        detail_score_text = _escape_markdown(str(detail_score))
+        label_text = _escape_markdown(label)
+        lines.append(divider)
+        lines.append(f"• Score: {detail_score_text} | Label: {label_text} (informational)")
+        note = info_note or "Early alert only — not actionable. STRONG/ULTRA rules unchanged."
+        lines.append(f"• Note: {_escape_markdown(note)}")
+        lines.append("")
     
     # HTF details
     trend_details = signal.get("trend_details") or {}

@@ -39,6 +39,15 @@ MAX_24H_CHANGE = 20.0  # Reject symbols pumping beyond 20%
 COOLDOWN_MINUTES = 60
 MAX_SYMBOLS_PER_SCAN = 50  # Limit to top 50 by volume
 
+# WATCH_PREMIUM controls
+# - ENABLE_WATCH_PREMIUM=False disables these informational alerts immediately
+# - Adjust WATCH_PREMIUM_MIN_SCORE to tune how many WATCH results get promoted
+# - The label used in Telegram is WATCH_PREMIUM_TG_LABEL and the log line "WATCH_PREMIUM sent…".
+# - Verify by sending a WATCH with score>=WATCH_PREMIUM_MIN_SCORE and watching for the INFO line + Telegram payload.
+ENABLE_WATCH_PREMIUM = True  # Toggle informational WATCH alerts (no post-signal effects)
+WATCH_PREMIUM_MIN_SCORE = 18
+WATCH_PREMIUM_TG_LABEL = "WATCH_PREMIUM"
+
 # Pre-signal gating filters
 MA60_PERIOD = 60
 RSI_PRE_FILTER_THRESHOLD = 60.0

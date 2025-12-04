@@ -340,6 +340,7 @@ async def main_loop():
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         scan_count = 0
         total_signals = 0
+        watch_premium_sent = 0
         
         while True:
             try:
@@ -382,21 +383,33 @@ async def main_loop():
 
                             label = signal.get('label')
                             total_signals += 1
+                            score_total_value = signal.get('score_total', signal.get('total_score'))
+                            try:
+                                score_total_float = float(score_total_value) if score_total_value is not None else None
+                            except (TypeError, ValueError):
+                                score_total_float = None
+                            original_label = label
 
                             # Cooldown is applied only to actionable signals.
                             # WATCH should not block the symbol from generating future STRONG/ULTRA.
-                            if label in {"STRONG_BUY", "ULTRA_BUY"}:
+                            if original_label in {"STRONG_BUY", "ULTRA_BUY"}:
                                 last_signal_times[symbol] = datetime.now()
 
                             blocked_reason = None
-                            if label in {"STRONG_BUY", "ULTRA_BUY"} and signal_monitor.is_symbol_blocked(symbol):
+                            if original_label in {"STRONG_BUY", "ULTRA_BUY"} and signal_monitor.is_symbol_blocked(symbol):
                                 blocked_reason = signal_monitor.get_block_reason(symbol) or "Post-signal block active"
                                 label = "WATCH"
                                 signal['label'] = label
                                 logger.info("Blocking STRONG/ULTRA for %s due to %s", symbol, blocked_reason)
 
-                            should_notify = label in {"STRONG_BUY", "ULTRA_BUY"}
-                            should_register = label in {"STRONG_BUY", "ULTRA_BUY"}
+                            should_notify_strong = label in {"STRONG_BUY", "ULTRA_BUY"}
+                            should_register = should_notify_strong
+                            should_notify_watch_premium = (
+                                original_label == "WATCH"
+                                and score_total_float is not None
+                                and config.ENABLE_WATCH_PREMIUM
+                                and score_total_float >= config.WATCH_PREMIUM_MIN_SCORE
+                            )
                             
                             # Log to CSV
                             log_module.log_signal_to_csv(
@@ -410,9 +423,21 @@ async def main_loop():
                             )
                             
                             # Send to Telegram
-                            if config.ENABLE_TELEGRAM and should_notify and not in_warmup:
-                                message = telegram_bot.format_signal_message(signal)
-                                await telegram_bot.send_telegram_message(message)
+                            if config.ENABLE_TELEGRAM and not in_warmup:
+                                if should_notify_strong:
+                                    message = telegram_bot.format_signal_message(signal)
+                                    await telegram_bot.send_telegram_message(message)
+                                elif should_notify_watch_premium:
+                                    info_note = "Early alert only — not actionable. STRONG/ULTRA rules unchanged."
+                                    message = telegram_bot.format_signal_message(
+                                        signal,
+                                        display_label=config.WATCH_PREMIUM_TG_LABEL,
+                                        info_note=info_note,
+                                    )
+                                    await telegram_bot.send_telegram_message(message)
+                                    watch_premium_sent += 1
+                                    log_score = score_total_float if score_total_float is not None else score_total_value
+                                    logger.info("WATCH_PREMIUM sent for %s score=%s", symbol, log_score)
                             
                             # Console output
                             label_emoji = {
@@ -457,6 +482,7 @@ async def main_loop():
                 scan_duration = (datetime.now() - scan_start).seconds
                 logger.info(f"Scan completed in {scan_duration} seconds")
                 logger.info(f"Total signals generated: {total_signals}")
+                logger.info(f"Watch premium alerts sent: {watch_premium_sent}")
                 
                 # Clean up old cooldowns
                 current_time = datetime.now()
