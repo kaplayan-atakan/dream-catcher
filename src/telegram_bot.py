@@ -66,6 +66,14 @@ def format_signal_message(
         header_emoji = "🔔🌟"
         divider = "━━━━━━━━━━━━━━━━━━━━"
         signal_type = "WATCH PREMIUM"
+    elif "MOMENTUM_ALERT" in str(label):
+        header_emoji = "🚀💨"
+        divider = "━━━━━━━━━━━━━━━━━━━━"
+        signal_type = "MOMENTUM ALERT"
+    elif "PUMP_ALERT" in str(label):
+        header_emoji = "📈🔥"
+        divider = "━━━━━━━━━━━━━━━━━━━━"
+        signal_type = "PUMP ALERT"
     elif "DIP_ALERT" in str(label):
         header_emoji = "🎯💰"
         divider = "━━━━━━━━━━━━━━━━━━━━"

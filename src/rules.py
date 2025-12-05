@@ -145,6 +145,132 @@ def check_dip_hunter_signal(
     
     return True, label, final_score, reasons
 
+
+def check_momentum_alert_signal(
+    rsi_value: float,
+    price: float,
+    ema20: Optional[float],
+    change_24h_pct: float,
+    base_score: int,
+) -> Tuple[bool, str, int, List[str]]:
+    """
+    Check if conditions match MOMENTUM_ALERT mode.
+    
+    Conditions:
+    - RSI in strong zone (55-65)
+    - Price above EMA20 by 1-3%
+    - 24h change +2% to +8% (up zone, not too late)
+    - Score >= MOMENTUM_MIN_SCORE
+    
+    Returns:
+        (is_momentum_signal, label, adjusted_score, reasons)
+    """
+    if not getattr(config, "ENABLE_MOMENTUM_ALERT", False):
+        return False, "", 0, []
+    
+    reasons = []
+    
+    # Get zones
+    rsi_zone = get_rsi_zone(rsi_value)
+    ema_zone, ema_dist = get_ema_zone(price, ema20)
+    change_zone = get_24h_zone(change_24h_pct)
+    
+    # Check RSI condition: must be in strong zone
+    rsi_min = getattr(config, "MOMENTUM_RSI_MIN", 55)
+    rsi_max = getattr(config, "MOMENTUM_RSI_MAX", 65)
+    if not (rsi_min <= rsi_value <= rsi_max):
+        return False, "", 0, []
+    
+    # Check EMA condition: must be above by 1-3%
+    ema_dist_min = getattr(config, "MOMENTUM_EMA_DIST_MIN_PCT", 1.0)
+    ema_dist_max = getattr(config, "MOMENTUM_EMA_DIST_MAX_PCT", 3.0)
+    if not (ema_dist_min <= ema_dist <= ema_dist_max):
+        return False, "", 0, []
+    
+    # Check 24h change condition: up zone but not too extended
+    change_min = getattr(config, "MOMENTUM_24H_CHANGE_MIN", 2.0)
+    change_max = getattr(config, "MOMENTUM_24H_CHANGE_MAX", 8.0)
+    if not (change_min <= change_24h_pct <= change_max):
+        return False, "", 0, []
+    
+    # Check minimum score
+    min_score = getattr(config, "MOMENTUM_MIN_SCORE", 10)
+    if base_score < min_score:
+        return False, "", 0, []
+    
+    # All conditions met - this is a MOMENTUM signal
+    reasons.append(f"🚀 MOMENTUM_ALERT: RSI={rsi_value:.0f} ({rsi_zone})")
+    reasons.append(f"📈 EMA20 distance: +{ema_dist:.1f}% ({ema_zone})")
+    reasons.append(f"📊 24h change: +{change_24h_pct:.1f}% ({change_zone})")
+    reasons.append(f"💪 Strong trend continuation pattern")
+    
+    label = getattr(config, "MOMENTUM_SIGNAL_LABEL", "MOMENTUM_ALERT")
+    
+    return True, label, base_score, reasons
+
+
+def check_pump_alert_signal(
+    rsi_value: float,
+    price: float,
+    ema20: Optional[float],
+    change_24h_pct: float,
+    base_score: int,
+) -> Tuple[bool, str, int, List[str]]:
+    """
+    Check if conditions match PUMP_ALERT mode.
+    
+    Conditions:
+    - RSI in recovery zone (35-45)
+    - Price near EMA20 (-1% to +1%)
+    - 24h change >= +5% (pump zone)
+    - Score >= PUMP_MIN_SCORE
+    
+    Returns:
+        (is_pump_signal, label, adjusted_score, reasons)
+    """
+    if not getattr(config, "ENABLE_PUMP_ALERT", False):
+        return False, "", 0, []
+    
+    reasons = []
+    
+    # Get zones
+    rsi_zone = get_rsi_zone(rsi_value)
+    ema_zone, ema_dist = get_ema_zone(price, ema20)
+    change_zone = get_24h_zone(change_24h_pct)
+    
+    # Check RSI condition: must be in recovery zone
+    rsi_min = getattr(config, "PUMP_RSI_MIN", 35)
+    rsi_max = getattr(config, "PUMP_RSI_MAX", 45)
+    if not (rsi_min <= rsi_value <= rsi_max):
+        return False, "", 0, []
+    
+    # Check EMA condition: must be near (-1% to +1%)
+    ema_dist_min = getattr(config, "PUMP_EMA_DIST_MIN_PCT", -1.0)
+    ema_dist_max = getattr(config, "PUMP_EMA_DIST_MAX_PCT", 1.0)
+    if not (ema_dist_min <= ema_dist <= ema_dist_max):
+        return False, "", 0, []
+    
+    # Check 24h change condition: must be pump zone
+    change_min = getattr(config, "PUMP_24H_CHANGE_MIN", 5.0)
+    if change_24h_pct < change_min:
+        return False, "", 0, []
+    
+    # Check minimum score
+    min_score = getattr(config, "PUMP_MIN_SCORE", 7)
+    if base_score < min_score:
+        return False, "", 0, []
+    
+    # All conditions met - this is a PUMP signal
+    reasons.append(f"📈 PUMP_ALERT: RSI={rsi_value:.0f} ({rsi_zone})")
+    reasons.append(f"📊 EMA20 distance: {ema_dist:+.1f}% ({ema_zone})")
+    reasons.append(f"🔥 24h change: +{change_24h_pct:.1f}% (pump day!)")
+    reasons.append(f"🚀 Recovery + pump momentum pattern")
+    
+    label = getattr(config, "PUMP_SIGNAL_LABEL", "PUMP_ALERT")
+    
+    return True, label, base_score, reasons
+
+
 @dataclass
 class BlockScore:
     score: int
@@ -774,6 +900,92 @@ def decide_signal_label(
                 pa_details=pa_block.details,
                 htf_details=htf_block.details if htf_block else None,
                 filter_notes=filter_notes,
+            )
+
+    # === MOMENTUM_ALERT CHECK (V7) ===
+    # Check after DIP_ALERT but before regular label logic
+    if getattr(config, "ENABLE_MOMENTUM_ALERT", False):
+        ctx = pre_signal_context or {}
+        price = ctx.get("last_close", 0)
+        ema20 = ctx.get("ema20_15m", 0)
+        change_24h = ctx.get("change_24h_pct", 0)
+        
+        is_momentum, momentum_label, momentum_score, momentum_reasons = check_momentum_alert_signal(
+            rsi_value=rsi_value,
+            price=price,
+            ema20=ema20,
+            change_24h_pct=change_24h,
+            base_score=score_core,
+        )
+        
+        if is_momentum:
+            reasons.extend(momentum_reasons)
+            filter_notes_momentum: List[str] = []
+            return SignalResult(
+                symbol=symbol,
+                trend_score=trend_component,
+                osc_score=osc_component,
+                vol_score=vol_component,
+                pa_score=pa_component,
+                htf_bonus=htf_bonus,
+                score_core=score_core,
+                score_total=momentum_score + htf_bonus,
+                label=momentum_label,
+                reasons=reasons[:7],
+                rsi=rsi_value,
+                price=meta.get("price") if meta else 0.0,
+                price_change_pct=meta.get("price_change_pct") if meta else 0.0,
+                quote_volume=meta.get("quote_volume") if meta else 0.0,
+                risk_tag="MOMENTUM",
+                trend_details=trend_block.details,
+                osc_details=osc_block.details,
+                vol_details=vol_block.details,
+                pa_details=pa_block.details,
+                htf_details=htf_block.details if htf_block else None,
+                filter_notes=filter_notes_momentum,
+            )
+
+    # === PUMP_ALERT CHECK (V7) ===
+    # Check after MOMENTUM_ALERT but before regular label logic
+    if getattr(config, "ENABLE_PUMP_ALERT", False):
+        ctx = pre_signal_context or {}
+        price = ctx.get("last_close", 0)
+        ema20 = ctx.get("ema20_15m", 0)
+        change_24h = ctx.get("change_24h_pct", 0)
+        
+        is_pump, pump_label, pump_score, pump_reasons = check_pump_alert_signal(
+            rsi_value=rsi_value,
+            price=price,
+            ema20=ema20,
+            change_24h_pct=change_24h,
+            base_score=score_core,
+        )
+        
+        if is_pump:
+            reasons.extend(pump_reasons)
+            filter_notes_pump: List[str] = []
+            return SignalResult(
+                symbol=symbol,
+                trend_score=trend_component,
+                osc_score=osc_component,
+                vol_score=vol_component,
+                pa_score=pa_component,
+                htf_bonus=htf_bonus,
+                score_core=score_core,
+                score_total=pump_score + htf_bonus,
+                label=pump_label,
+                reasons=reasons[:7],
+                rsi=rsi_value,
+                price=meta.get("price") if meta else 0.0,
+                price_change_pct=meta.get("price_change_pct") if meta else 0.0,
+                quote_volume=meta.get("quote_volume") if meta else 0.0,
+                risk_tag="PUMP",
+                trend_details=trend_block.details,
+                osc_details=osc_block.details,
+                vol_details=vol_block.details,
+                pa_details=pa_block.details,
+                htf_details=htf_block.details if htf_block else None,
+                filter_notes=filter_notes_pump,
             )
 
     label = "NO_SIGNAL"

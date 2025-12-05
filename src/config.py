@@ -295,22 +295,75 @@ BACKTEST_TP_PERCENTS = [2.0, 3.0, 5.0, 10.0]
 BACKTEST_SL_PERCENTS = [1.0, 2.0, 3.0]
 BACKTEST_LOOKAHEAD_BARS = 96
 
-# === DIP HUNTER MODE (V5) ===
-# Targets high-performance zone combination: RSI oversold + EMA below + 24h dump
-# Cross-zone analysis shows 68.8% win rate for this combination
+# === MOMENTUM_ALERT SETTINGS (V7) ===
+# ❌ DISABLED: Backtest showed 45-47% WR across 186k trades - worse than random
+# Original claim of 72.7% was small-sample bias
+ENABLE_MOMENTUM_ALERT = False           # V8: Disabled (backtest: 47.5% WR max)
+
+# Conditions (ALL must be true)
+MOMENTUM_RSI_MIN = 55                   # RSI lower bound (strong zone)
+MOMENTUM_RSI_MAX = 65                   # RSI upper bound
+MOMENTUM_EMA_ZONE = "above"             # EMA zone required
+MOMENTUM_EMA_DIST_MIN_PCT = 1.0         # Min % above EMA20
+MOMENTUM_EMA_DIST_MAX_PCT = 3.0         # Max % above EMA20 (not too extended)
+MOMENTUM_24H_CHANGE_MIN = 2.0           # Min 24h change (up zone)
+MOMENTUM_24H_CHANGE_MAX = 8.0           # Max 24h change (not too late)
+
+# Scoring
+MOMENTUM_MIN_SCORE = 10                 # High threshold for quality
+MOMENTUM_SIGNAL_LABEL = "MOMENTUM_ALERT"
+MOMENTUM_COOLDOWN_MINUTES = 45
+MOMENTUM_NOTIFY_TELEGRAM = True
+
+# === PUMP_ALERT SETTINGS (V7) ===
+# ❌ DISABLED: Backtest showed 47% WR with only 3,322 trades - insufficient volume
+# Best variant PUMP_9 had 54.9% WR but only 798 trades
+ENABLE_PUMP_ALERT = False               # V8: Disabled (backtest: low volume, 47% WR)
+
+# Conditions (ALL must be true)
+PUMP_RSI_MIN = 35                       # RSI lower bound (recovery zone)
+PUMP_RSI_MAX = 45                       # RSI upper bound
+PUMP_EMA_ZONE = "near"                  # EMA zone required
+PUMP_EMA_DIST_MIN_PCT = -1.0            # Min % from EMA20
+PUMP_EMA_DIST_MAX_PCT = 1.0             # Max % from EMA20
+PUMP_24H_CHANGE_MIN = 5.0               # Min 24h change (pump zone)
+
+# Scoring
+PUMP_MIN_SCORE = 7                      # Moderate threshold
+PUMP_SIGNAL_LABEL = "PUMP_ALERT"
+PUMP_COOLDOWN_MINUTES = 45
+PUMP_NOTIFY_TELEGRAM = True
+
+# === DIP HUNTER MODE (V8 - BACKTEST VALIDATED) ===
+# ✅ WINNER: DIP_6 = 62.5% WR, 7,341 trades, +1.82% avg return
+# Backtest: 383 symbols, 173 days, entry at t+1 open, 24-bar hold
 ENABLE_DIP_HUNTER = True
 
-# DIP_HUNTER Entry Conditions (all must be true)
-DIP_RSI_MAX = 35                    # RSI must be below this (oversold)
+# DIP_HUNTER Entry Conditions (V8 - DIP_6 EXACT)
+# DIP_6: RSI≤40, EMA≤-1.5%, 24h≤-7% → 62.5% WR, 7,341 trades
+DIP_RSI_MAX = 40                    # V8: RSI≤40
 DIP_EMA_ZONE = "below"              # Price must be below EMA20
-DIP_EMA_DIST_MIN_PCT = -1.0         # At least 1% below EMA20
-DIP_24H_CHANGE_MAX = -5.0           # 24h change must be negative (dump)
+DIP_EMA_DIST_MIN_PCT = -1.5         # V8: ≤-1.5% from EMA (DIP_6 exact)
+DIP_24H_CHANGE_MAX = -7.0           # V8: ≤-7% 24h change (DIP_6 exact)
 
 # DIP_HUNTER Signal Settings
-DIP_MIN_SCORE = 6                   # Lower score threshold for dip signals
+DIP_MIN_SCORE = 5                   # V8: score≥5 (DIP_6 exact)
 DIP_SIGNAL_LABEL = "DIP_ALERT"      # Label for dip signals
 DIP_NOTIFY_TELEGRAM = True          # Send to Telegram
 DIP_COOLDOWN_MINUTES = 45           # Separate cooldown for dip signals
+
+# === DIP_ALERT TRACKING (V8) ===
+ENABLE_DIP_TRACKING = True              # Track all DIP signals as virtual trades
+ENABLE_DIP_TP_SL_NOTIFICATIONS = True   # Send TP/SL messages to Telegram
+
+# TP/SL Thresholds
+DIP_TP1_PCT = 2.0                       # First take profit level (+2%)
+DIP_TP2_PCT = 3.0                       # Second take profit level (+3%)
+DIP_SL_PCT = -3.0                       # Stop loss level (-3%)
+DIP_TIMEOUT_HOURS = 24                  # Max hold time before forced exit
+
+# Monitoring
+DIP_PRICE_CHECK_INTERVAL_SECONDS = 60   # Check prices every 60 seconds
 
 # DIP_HUNTER Bonus Scoring
 DIP_OVERSOLD_BONUS = 3              # Bonus when RSI < 30

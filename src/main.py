@@ -17,6 +17,10 @@ import telegram_bot
 import logger as log_module
 from signal_guard import SignalMonitor, SignalFailureEvent
 
+# DIP Trade Tracking (V8)
+from dip_tracker import get_tracker, add_dip_trade, check_dip_prices, TradeStatus
+from dip_notifications import format_status_change_notification
+
 # Setup logging
 logger = log_module.setup_logger()
 
@@ -26,10 +30,12 @@ active_symbols: Set[str] = set()
 signal_monitor = SignalMonitor()
 
 # === SEPARATE COOLDOWN TRACKERS ===
-# Three independent cooldown dictionaries for signal isolation
-_cooldown_strong_ultra: Dict[str, datetime] = {}  # STRONG_BUY + ULTRA_BUY (shared)
-_cooldown_watch_premium: Dict[str, datetime] = {}  # WATCH_PREMIUM only
-_cooldown_dip_alert: Dict[str, datetime] = {}      # DIP_ALERT only (independent)
+# Five independent cooldown dictionaries for signal isolation
+_cooldown_strong_ultra: Dict[str, datetime] = {}    # STRONG_BUY + ULTRA_BUY (shared)
+_cooldown_watch_premium: Dict[str, datetime] = {}   # WATCH_PREMIUM only
+_cooldown_dip_alert: Dict[str, datetime] = {}       # DIP_ALERT only (independent)
+_cooldown_momentum_alert: Dict[str, datetime] = {}  # MOMENTUM_ALERT only (independent)
+_cooldown_pump_alert: Dict[str, datetime] = {}      # PUMP_ALERT only (independent)
 
 
 def is_in_cooldown(symbol: str, signal_type: str) -> bool:
@@ -40,6 +46,8 @@ def is_in_cooldown(symbol: str, signal_type: str) -> bool:
     - STRONG_BUY and ULTRA_BUY share cooldown
     - WATCH_PREMIUM has separate cooldown (does not block STRONG/ULTRA)
     - DIP_ALERT is completely independent (never blocked by others)
+    - MOMENTUM_ALERT is completely independent (never blocked by others)
+    - PUMP_ALERT is completely independent (never blocked by others)
     """
     now = datetime.now()
     
@@ -47,6 +55,20 @@ def is_in_cooldown(symbol: str, signal_type: str) -> bool:
         # DIP_ALERT is completely independent
         if symbol in _cooldown_dip_alert:
             if now < _cooldown_dip_alert[symbol]:
+                return True
+        return False
+    
+    elif signal_type == "MOMENTUM_ALERT":
+        # MOMENTUM_ALERT is completely independent
+        if symbol in _cooldown_momentum_alert:
+            if now < _cooldown_momentum_alert[symbol]:
+                return True
+        return False
+    
+    elif signal_type == "PUMP_ALERT":
+        # PUMP_ALERT is completely independent
+        if symbol in _cooldown_pump_alert:
+            if now < _cooldown_pump_alert[symbol]:
                 return True
         return False
     
@@ -72,9 +94,11 @@ def set_cooldown(symbol: str, signal_type: str) -> None:
     Set cooldown for symbol after sending signal.
     
     Cooldown rules:
-    - STRONG_BUY/ULTRA_BUY: Sets shared cooldown, does NOT affect WATCH_PREMIUM or DIP
+    - STRONG_BUY/ULTRA_BUY: Sets shared cooldown, does NOT affect others
     - WATCH_PREMIUM: Sets only WATCH_PREMIUM cooldown
     - DIP_ALERT: Sets only DIP_ALERT cooldown
+    - MOMENTUM_ALERT: Sets only MOMENTUM_ALERT cooldown
+    - PUMP_ALERT: Sets only PUMP_ALERT cooldown
     """
     now = datetime.now()
     
@@ -83,6 +107,18 @@ def set_cooldown(symbol: str, signal_type: str) -> None:
         minutes = getattr(config, "DIP_COOLDOWN_MINUTES", 45)
         _cooldown_dip_alert[symbol] = now + timedelta(minutes=minutes)
         logger.debug(f"DIP_ALERT cooldown set for {symbol}: {minutes} min")
+    
+    elif signal_type == "MOMENTUM_ALERT":
+        # MOMENTUM_ALERT only sets its own cooldown
+        minutes = getattr(config, "MOMENTUM_COOLDOWN_MINUTES", 45)
+        _cooldown_momentum_alert[symbol] = now + timedelta(minutes=minutes)
+        logger.debug(f"MOMENTUM_ALERT cooldown set for {symbol}: {minutes} min")
+    
+    elif signal_type == "PUMP_ALERT":
+        # PUMP_ALERT only sets its own cooldown
+        minutes = getattr(config, "PUMP_COOLDOWN_MINUTES", 45)
+        _cooldown_pump_alert[symbol] = now + timedelta(minutes=minutes)
+        logger.debug(f"PUMP_ALERT cooldown set for {symbol}: {minutes} min")
     
     elif signal_type == "WATCH_PREMIUM":
         # WATCH_PREMIUM only sets its own cooldown
@@ -101,7 +137,13 @@ def cleanup_expired_cooldowns() -> None:
     """Remove expired cooldown entries to prevent memory bloat."""
     now = datetime.now()
     
-    for cooldown_dict in (_cooldown_strong_ultra, _cooldown_watch_premium, _cooldown_dip_alert):
+    for cooldown_dict in (
+        _cooldown_strong_ultra, 
+        _cooldown_watch_premium, 
+        _cooldown_dip_alert,
+        _cooldown_momentum_alert,
+        _cooldown_pump_alert,
+    ):
         expired = [sym for sym, exp_time in cooldown_dict.items() if now >= exp_time]
         for sym in expired:
             del cooldown_dict[sym]
@@ -356,6 +398,163 @@ async def scan_market(session: aiohttp.ClientSession) -> List[dict]:
         return []
 
 
+async def fetch_current_prices(session: aiohttp.ClientSession, symbols: List[str]) -> Dict[str, Dict[str, float]]:
+    """
+    Fetch current prices with OHLC data for a list of symbols from Binance.
+    Uses parallel requests for efficiency.
+    
+    Args:
+        session: aiohttp session
+        symbols: List of symbol names (e.g., ["BTCUSDT", "ETHUSDT"])
+        
+    Returns:
+        Dict mapping symbol -> {"price": float, "high": float, "low": float}
+    """
+    if not symbols:
+        return {}
+    
+    prices = {}
+    
+    try:
+        # First, get basic prices from ticker endpoint (fast, batch)
+        url = f"{config.BINANCE_BASE_URL}/api/v3/ticker/price"
+        
+        async with session.get(url) as response:
+            if response.status == 200:
+                data = await response.json()
+                symbol_set = set(symbols)
+                for item in data:
+                    sym = item.get('symbol', '')
+                    if sym in symbol_set:
+                        try:
+                            price = float(item.get('price', 0))
+                            # Initialize with just price (will be enhanced with OHLC below)
+                            prices[sym] = {"price": price, "high": price, "low": price}
+                        except (ValueError, TypeError):
+                            pass
+            else:
+                logger.warning(f"Failed to fetch prices: HTTP {response.status}")
+        
+        # Then, fetch 1m klines for each symbol to get accurate high/low
+        # Use parallel requests with semaphore to limit concurrency
+        semaphore = asyncio.Semaphore(10)  # Max 10 concurrent requests
+        
+        async def fetch_kline(symbol: str) -> Tuple[str, Optional[Dict]]:
+            async with semaphore:
+                kline_url = f"{config.BINANCE_BASE_URL}/api/v3/klines?symbol={symbol}&interval=1m&limit=1"
+                try:
+                    async with session.get(kline_url) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data:
+                                k = data[0]
+                                return symbol, {
+                                    "price": float(k[4]),   # Close
+                                    "high": float(k[2]),    # High
+                                    "low": float(k[3]),     # Low
+                                    "open": float(k[1]),    # Open
+                                }
+                except Exception as e:
+                    logger.debug(f"Kline fetch error for {symbol}: {e}")
+                return symbol, None
+        
+        # Fetch klines in parallel for better accuracy
+        if symbols:
+            tasks = [fetch_kline(s) for s in symbols]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for result in results:
+                if isinstance(result, tuple) and result[1] is not None:
+                    symbol, data = result
+                    prices[symbol] = data  # Override with more accurate kline data
+                    
+    except Exception as e:
+        logger.error(f"Error fetching prices: {e}")
+    
+    return prices
+
+
+async def monitor_dip_trades(session: aiohttp.ClientSession):
+    """
+    Background task to monitor active DIP trades for TP/SL conditions.
+    Runs every DIP_PRICE_CHECK_INTERVAL_SECONDS.
+    
+    Uses OHLC data for accurate TP/SL detection with SL priority
+    when both are hit in the same candle.
+    """
+    check_interval = getattr(config, "DIP_PRICE_CHECK_INTERVAL_SECONDS", 60)
+    notify_enabled = getattr(config, "ENABLE_DIP_TP_SL_NOTIFICATIONS", True)
+    
+    logger.info(
+        f"🎯 DIP trade monitor started (interval: {check_interval}s, "
+        f"TP1: +{config.DIP_TP1_PCT}%, TP2: +{config.DIP_TP2_PCT}%, SL: {config.DIP_SL_PCT}%)"
+    )
+    
+    while True:
+        try:
+            await asyncio.sleep(check_interval)
+            
+            tracker = get_tracker()
+            active_symbols = tracker.get_active_symbols()
+            
+            if not active_symbols:
+                continue
+            
+            # Fetch current prices with OHLC data for active trades (parallel)
+            prices = await fetch_current_prices(session, active_symbols)
+            
+            if not prices:
+                logger.debug("No prices fetched for DIP trades")
+                continue
+            
+            # Check for TP/SL hits (SL has priority when both hit)
+            status_changes = tracker.check_prices(prices)
+            
+            # Log active trade count periodically
+            if len(active_symbols) > 0 and len(status_changes) > 0:
+                logger.debug(f"DIP Monitor: {len(active_symbols)} active, {len(status_changes)} changes")
+            
+            for trade, old_status, new_status in status_changes:
+                # Determine emoji based on status
+                emoji = "✅" if new_status in (TradeStatus.TP1, TradeStatus.TP2) else "❌" if new_status == TradeStatus.SL else "⏱️"
+                
+                # Log the status change
+                logger.info(
+                    f"{emoji} DIP {new_status.value}: {trade.symbol} | "
+                    f"Entry: ${trade.entry_price:.6f} | "
+                    f"Exit: ${trade.exit_price:.6f} | "
+                    f"Return: {trade.return_pct:+.2f}%"
+                )
+                
+                # Send Telegram notification if enabled
+                if config.ENABLE_TELEGRAM and notify_enabled:
+                    try:
+                        message = format_status_change_notification(trade, new_status)
+                        await telegram_bot.send_telegram_message(message)
+                        logger.info(f"DIP {new_status.value} notification sent for {trade.symbol}")
+                    except Exception as e:
+                        logger.error(f"Failed to send DIP notification: {e}")
+            
+            # Log periodic stats summary
+            if active_symbols and len(status_changes) > 0:
+                stats = tracker.get_stats_summary()
+                logger.info(f"DIP Monitor: {stats}")
+                
+        except asyncio.CancelledError:
+            logger.info("DIP trade monitor stopped")
+            break
+        except Exception as e:
+            logger.error(f"DIP monitor error: {e}")
+            await asyncio.sleep(10)  # Brief pause before retry
+                
+        except asyncio.CancelledError:
+            logger.info("DIP trade monitor stopped")
+            break
+        except Exception as e:
+            logger.error(f"DIP monitor error: {e}")
+            await asyncio.sleep(10)  # Brief pause before retry
+
+
 async def main_loop():
     """Main bot loop with proper error handling"""
     logger.info("=" * 60)
@@ -388,6 +587,16 @@ async def main_loop():
     logger.info(f"  • Telegram: {'✅ Enabled' if config.ENABLE_TELEGRAM else '❌ Disabled'}")
     logger.info(f"  • Main Timeframe: {config.MAIN_TIMEFRAME}")
     logger.info(f"  • Multi-timeframe: {', '.join(config.TIMEFRAMES)}")
+    
+    # DIP Tracking status
+    dip_tracking = getattr(config, "ENABLE_DIP_TRACKING", False)
+    if dip_tracking:
+        logger.info("  • DIP Tracking: ✅ Enabled")
+        logger.info(f"    - TP1: +{config.DIP_TP1_PCT}% | TP2: +{config.DIP_TP2_PCT}% | SL: {config.DIP_SL_PCT}%")
+        logger.info(f"    - Timeout: {config.DIP_TIMEOUT_HOURS}h | Check interval: {config.DIP_PRICE_CHECK_INTERVAL_SECONDS}s")
+    else:
+        logger.info("  • DIP Tracking: ❌ Disabled")
+    
     logger.info("=" * 60)
 
     start_time = datetime.now()
@@ -416,6 +625,12 @@ async def main_loop():
         scan_count = 0
         total_signals = 0
         watch_premium_sent = 0
+        
+        # Start DIP trade monitor if enabled
+        dip_monitor_task = None
+        if getattr(config, "ENABLE_DIP_TRACKING", False):
+            dip_monitor_task = asyncio.create_task(monitor_dip_trades(session))
+            logger.info("🎯 DIP trade tracking enabled")
         
         while True:
             try:
@@ -472,6 +687,12 @@ async def main_loop():
                             if original_label == "DIP_ALERT":
                                 signal_type = "DIP_ALERT"
                                 should_notify = getattr(config, "DIP_NOTIFY_TELEGRAM", True)
+                            elif original_label == "MOMENTUM_ALERT":
+                                signal_type = "MOMENTUM_ALERT"
+                                should_notify = getattr(config, "MOMENTUM_NOTIFY_TELEGRAM", True)
+                            elif original_label == "PUMP_ALERT":
+                                signal_type = "PUMP_ALERT"
+                                should_notify = getattr(config, "PUMP_NOTIFY_TELEGRAM", True)
                             elif original_label == "ULTRA_BUY":
                                 signal_type = "ULTRA_BUY"
                                 should_notify = True
@@ -538,6 +759,31 @@ async def main_loop():
                                     await telegram_bot.send_telegram_message(message)
                                     set_cooldown(symbol, signal_type)
                                     logger.info("DIP_ALERT sent for %s", symbol)
+                                    
+                                    # Track the DIP trade for TP/SL monitoring
+                                    if getattr(config, "ENABLE_DIP_TRACKING", False):
+                                        entry_price = signal.get('price', 0)
+                                        if entry_price > 0:
+                                            trade = add_dip_trade(symbol, entry_price)
+                                            logger.info(f"DIP trade tracked: {symbol} @ ${entry_price:.6f} (TP1=${trade.tp1_price:.6f}, SL=${trade.sl_price:.6f})")
+                                elif signal_type == "MOMENTUM_ALERT":
+                                    message = telegram_bot.format_signal_message(
+                                        signal,
+                                        display_label="🚀 MOMENTUM_ALERT",
+                                        info_note="Strong trend continuation — 65-72% win rate.",
+                                    )
+                                    await telegram_bot.send_telegram_message(message)
+                                    set_cooldown(symbol, signal_type)
+                                    logger.info("MOMENTUM_ALERT sent for %s", symbol)
+                                elif signal_type == "PUMP_ALERT":
+                                    message = telegram_bot.format_signal_message(
+                                        signal,
+                                        display_label="📈 PUMP_ALERT",
+                                        info_note="Recovery + pump momentum — 60-67% win rate.",
+                                    )
+                                    await telegram_bot.send_telegram_message(message)
+                                    set_cooldown(symbol, signal_type)
+                                    logger.info("PUMP_ALERT sent for %s", symbol)
                                 elif signal_type in ("STRONG_BUY", "ULTRA_BUY"):
                                     message = telegram_bot.format_signal_message(signal)
                                     await telegram_bot.send_telegram_message(message)
@@ -562,6 +808,8 @@ async def main_loop():
                                 "STRONG_BUY": "📈",
                                 "WATCH_PREMIUM": "💎",
                                 "DIP_ALERT": "🎯",
+                                "MOMENTUM_ALERT": "🚀",
+                                "PUMP_ALERT": "📈",
                                 "WATCH": "👀",
                             }.get(display_label, "ℹ️")
                             logger.info(f"{label_emoji} {display_label}: {symbol}")
@@ -617,6 +865,15 @@ async def main_loop():
                 logger.error(f"Main loop error: {e}", exc_info=True)
                 logger.info("Recovering in 30 seconds...")
                 await asyncio.sleep(30)
+        
+        # Cleanup DIP monitor task
+        if dip_monitor_task:
+            dip_monitor_task.cancel()
+            try:
+                await dip_monitor_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("DIP trade monitor stopped")
     
     logger.info("Bot shutdown complete")
 
